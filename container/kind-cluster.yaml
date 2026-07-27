@@ -1,0 +1,13 @@
+# The AIos cluster.
+#
+# Deliberately binds NO host ports. This machine already hosts the dazl-local and
+# dazl-main kind clusters, which own 80/443 — an AIos node is reached over
+# `kubectl attach`, not over HTTP, so competing for host ports would buy nothing
+# and break whichever cluster lost.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: aios
+nodes:
+  - role: control-plane
+    labels:
+      aios.dev/node: control-plane

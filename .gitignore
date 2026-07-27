@@ -1,0 +1,13 @@
+# Rendered output — regenerate with `forge render`
+out/
+# Minimization journal and build logs — machine-local, can get large
+forge.journal.jsonl
+.forge/
+# The machine's own runtime state (agent journal), mounted from a PVC on a node
+.aios/
+# Scratch space for design candidates that lost
+.wf/
+__pycache__/
+*.pyc
+
+# aios.lock.json is deliberately NOT ignored: it is the artifact under review.

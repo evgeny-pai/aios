@@ -1,0 +1,170 @@
+{
+  "digest": "sha256:12d584becb6e47375992a4a033b94d95fe268802ada20633a48e75c640e80fe6",
+  "generated_by": {
+    "model": "fixture",
+    "provider": "echo"
+  },
+  "intents": [
+    {
+      "probes": [
+        "vim"
+      ],
+      "text": "edit code over ssh: syntax highlighting, multiple buffers, no X11 and no clipboard integration"
+    },
+    {
+      "probes": [],
+      "text": "build small C projects locally with make"
+    },
+    {
+      "probes": [],
+      "text": "reach the machine over ssh with key auth only, no password auth, no X forwarding"
+    }
+  ],
+  "make_conf": [
+    {
+      "key": "ACCEPT_KEYWORDS",
+      "value": "arm64",
+      "why": "spec: system.arch"
+    },
+    {
+      "key": "CFLAGS",
+      "value": "-O2 -pipe",
+      "why": "spec: system.cflags"
+    },
+    {
+      "key": "CHOST",
+      "value": "aarch64-unknown-linux-musl",
+      "why": "spec: system.arch + system.libc"
+    },
+    {
+      "key": "CXXFLAGS",
+      "value": "${CFLAGS}",
+      "why": "spec: system.cflags"
+    },
+    {
+      "key": "FEATURES",
+      "value": "buildpkg",
+      "why": "minimization rebuilds packages repeatedly; cache them"
+    },
+    {
+      "key": "MAKEOPTS",
+      "value": "-j8",
+      "why": "spec: system.makeopts"
+    },
+    {
+      "key": "USE",
+      "value": "-X -gtk -gnome -kde -qt5 -wayland -systemd -nls",
+      "why": "no intent implies a graphical session or localization"
+    }
+  ],
+  "minimized": {},
+  "notes": [
+    "produced by the offline echo backend — not a real lowering"
+  ],
+  "packages": [
+    {
+      "accept_keywords": [],
+      "atom": "app-editors/vim",
+      "probes": [
+        "vim"
+      ],
+      "use": [
+        {
+          "enabled": false,
+          "flag": "X",
+          "why": "intent[0]: no X11"
+        },
+        {
+          "enabled": false,
+          "flag": "acl",
+          "why": "no intent requires POSIX ACLs"
+        },
+        {
+          "enabled": false,
+          "flag": "gui",
+          "why": "intent[0]: no X11"
+        },
+        {
+          "enabled": false,
+          "flag": "nls",
+          "why": "no intent requires localization"
+        },
+        {
+          "enabled": false,
+          "flag": "perl",
+          "why": "no intent requires perl scripting"
+        },
+        {
+          "enabled": false,
+          "flag": "python",
+          "why": "no intent requires python scripting"
+        },
+        {
+          "enabled": false,
+          "flag": "ruby",
+          "why": "no intent requires ruby scripting"
+        },
+        {
+          "enabled": true,
+          "flag": "syntax",
+          "why": "intent[0]: syntax highlighting"
+        }
+      ],
+      "why": "intent[0]: edit code over ssh"
+    },
+    {
+      "accept_keywords": [],
+      "atom": "net-misc/openssh",
+      "probes": [],
+      "use": [
+        {
+          "enabled": false,
+          "flag": "X509",
+          "why": "intent[2]: key auth only"
+        },
+        {
+          "enabled": false,
+          "flag": "kerberos",
+          "why": "intent[2]: key auth only"
+        },
+        {
+          "enabled": false,
+          "flag": "ldns",
+          "why": "no intent requires SSHFP validation"
+        },
+        {
+          "enabled": false,
+          "flag": "pam",
+          "why": "intent[2]: no password auth"
+        }
+      ],
+      "why": "intent[2]: reach the machine over ssh"
+    },
+    {
+      "accept_keywords": [],
+      "atom": "sys-devel/make",
+      "probes": [],
+      "use": [
+        {
+          "enabled": false,
+          "flag": "nls",
+          "why": "no intent requires localization"
+        }
+      ],
+      "why": "intent[1]: build C projects with make"
+    }
+  ],
+  "schema": 1,
+  "spec_digest": "sha256:38b9e4e773514a6c7796109610b0b191fb74a61549d17389ea8eb11fe285f7ca",
+  "system": {
+    "arch": "aarch64",
+    "cflags": "-O2 -pipe",
+    "chost": "aarch64-unknown-linux-musl",
+    "init": "dinit",
+    "keyword": "arm64",
+    "libc": "musl",
+    "makeopts": "-j8",
+    "name": "aios-dev",
+    "profile": "default"
+  }
+}

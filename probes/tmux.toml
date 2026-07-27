@@ -1,0 +1,57 @@
+name        = "tmux"
+description = "A multiplexer that starts split in two, so a build never owns the terminal."
+atoms       = ["app-misc/tmux"]
+
+# Every check invokes tmux and lets tmux's own exit status decide the result. That is
+# deliberate: an earlier probe in this repo "passed" 2 of 3 checks on a machine where
+# the binary did not exist, because the shell plumbing around it set the status. See
+# skills/vacuous-probe-checks. Each check below fails with exit 127 if tmux is absent.
+#
+# -f /dev/null so a stray ~/.tmux.conf cannot change the answer, and TMUX_TMPDIR in
+# the scratch dir so the socket lands somewhere writable and disappears with it.
+
+[[check]]
+name = "tmux is installed and reports a version"
+script = '''
+command -v tmux
+tmux -V | grep -qE 'tmux [0-9]+\.[0-9]+'
+'''
+
+[[check]]
+name = "starts a session split into two panes"
+script = '''
+export TMUX_TMPDIR="$T"
+tmux -f /dev/null new-session -d -s probe -x 80 -y 24
+tmux -f /dev/null split-window -t probe
+panes=$(tmux -f /dev/null list-panes -t probe | wc -l)
+tmux -f /dev/null kill-session -t probe
+test "$panes" -eq 2
+'''
+
+[[check]]
+name = "a pane keeps running after the client detaches"
+script = '''
+export TMUX_TMPDIR="$T"
+tmux -f /dev/null new-session -d -s bg "sleep 30"
+tmux -f /dev/null has-session -t bg
+tmux -f /dev/null kill-session -t bg
+'''
+
+[[check]]
+name = "panes are scriptable from the shell"
+script = '''
+export TMUX_TMPDIR="$T"
+tmux -f /dev/null new-session -d -s script
+tmux -f /dev/null send-keys -t script "printf marker > $T/out.txt" Enter
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$T/out.txt" ] && break; sleep 0.5; done
+tmux -f /dev/null kill-session -t script
+grep -qx marker "$T/out.txt"
+'''
+
+# Asserted absent, because the intent says so: a machine reached only over a k8s exec
+# has no X display and no mouse to give tmux.
+[[check]]
+name = "no X or mouse support compiled in"
+script = '''
+! ldd "$(command -v tmux)" 2>/dev/null | grep -qE 'libX11|libXt'
+'''

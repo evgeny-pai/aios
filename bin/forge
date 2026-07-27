@@ -1,0 +1,7 @@
+#!/bin/sh
+# forge launcher. Portable sh — the target has no bash guarantee.
+set -e
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m forge "$@"

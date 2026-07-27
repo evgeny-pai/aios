@@ -1,0 +1,106 @@
+#!/bin/sh
+# PID 1 on an AIos node.
+#
+# Not a real init — there is no hardware to bring up in a container, and pretending
+# otherwise would be theatre. What it does do is the honest container equivalent:
+# check the userland is intact, report each fact it verified, render the welcome
+# screen, and hand the terminal to the agent.
+#
+# It deliberately never exits. A pod whose PID 1 returns is a CrashLoopBackOff, and
+# an OS that dies when you close the terminal is not an OS.
+
+set -u
+
+AIOS_ROOT="${AIOS_ROOT:-/aios}"
+export PYTHONPATH="$AIOS_ROOT"
+export PYTHONDONTWRITEBYTECODE=1
+cd "$AIOS_ROOT" || exit 1
+
+if [ -n "${NO_COLOR:-}" ]; then
+    DIM=''; OK=''; WARN=''; ACCENT=''; OFF=''
+else
+    DIM=$(printf '\033[2m')
+    OK=$(printf '\033[38;5;79m')
+    WARN=$(printf '\033[38;5;179m')
+    ACCENT=$(printf '\033[38;5;117m')
+    OFF=$(printf '\033[0m')
+fi
+
+ical=0  # required checks that failed — a boot with any of these is not "clean"
+
+step() {
+    # step <ok|warn> <label> <detail>
+    if [ "$1" = ok ]; then
+        mark="${OK}  ok  ${OFF}"
+    else
+        mark="${WARN}  ..  ${OFF}"
+        ical=$((ical + 1))
+    fi
+    printf '%s%s%-16s%s %s\n' "$mark" "$DIM" "$2" "$OFF" "$3"
+}
+
+# Informational: absent credentials are a degraded agent, not a broken machine, so
+# this must not cost the boot its generation.
+note() {
+    printf '%s%s%-16s%s %s\n' "${WARN}  ..  ${OFF}" "$DIM" "$1" "$OFF" "$2"
+}
+
+py() { python3 -c "$1" 2>/dev/null; }
+
+printf '\n%s  AIos init%s\n' "$ACCENT" "$OFF"
+
+step ok "rootfs" "$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-gentoo}") $(uname -m)"
+step ok "kernel" "$(uname -sr)"
+
+pyver=$(py 'import sys; print(".".join(map(str, sys.version_info[:3])))')
+[ -n "$pyver" ] && step ok "python" "$pyver" || { step warn "python" "MISSING — the userland cannot run"; }
+
+forgever=$(py 'import forge; print(forge.__version__)')
+[ -n "$forgever" ] && step ok "forge" "$forgever" || step warn "forge" "not importable"
+
+spec=$(py '
+from forge import spec
+s = spec.load("aios.toml")
+print(f"{len(s.intents)} intents, {len(s.all_probes())} probe(s)")
+')
+[ -n "$spec" ] && step ok "machine spec" "$spec" || step warn "machine spec" "aios.toml unreadable"
+
+lock=$(py '
+from forge import lock
+l = lock.load("aios.lock.json")
+short = l["digest"][7:19]
+print(short + "... " + str(len(l["packages"])) + " packages")
+')
+[ -n "$lock" ] && step ok "lockfile" "$lock" || step warn "lockfile" "absent or digest mismatch"
+
+if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+    step ok "ai provider" "${AIOS_MODEL:-claude-haiku-4-5-20251001}"
+else
+    note "ai provider" "no credentials — agent will run degraded"
+fi
+
+# The generation is earned, not assumed: only a boot whose required checks all
+# passed counts as this machine having come up again.
+if [ "$ical" -eq 0 ]; then
+    gen=$(python3 -m aios.generation bump 2>/dev/null || echo '')
+    [ -n "$gen" ] && step ok "generation" "#$gen"
+else
+    note "generation" "not counted — $ical required check(s) failed"
+fi
+
+printf '\n'
+
+# A boot log is not a 24-line screen — `kubectl logs` scrolls, and the pty k8s
+# hands PID 1 reports an arbitrary default size. Left alone, the manifest budgets
+# for 24 lines and clips the intent text to fit a height nobody actually has.
+LINES="${AIOS_BOOT_LINES:-40}" python3 -m aios.welcome \
+    || printf '  AIos %s — welcome screen unavailable\n\n' "${forgever:-0.1.0}"
+
+# Hand over the terminal when there is one. `kubectl attach` gives PID 1 a tty;
+# `kubectl logs` does not, and must not block on a read that never returns.
+if [ -t 0 ]; then
+    python3 -m aios.agent || true
+    printf '\n%s  agent session ended. reattach with: kubectl exec -it aios -- aios%s\n' "$DIM" "$OFF"
+fi
+
+exec tail -f /dev/null

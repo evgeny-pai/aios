@@ -1,0 +1,52 @@
+#!/bin/sh
+# Interactive entry to a running AIos machine:
+#
+#     kubectl exec -it -n aios aios -- aios
+#
+# Welcome screen, then the agent prompt, directly on this terminal. The prompt is the
+# default surface — the first and only thing you land in.
+#
+# There was a tmux split here (agent on top, shell below) so a build could not own
+# the terminal. It is gone: detached panes ran the agent's never-quit loop with no
+# human reading it, and a multiplexer you have to escape from is worse than no
+# multiplexer. tmux is still installed and its probe still passes, so it is one env
+# var away if you want it back, and `tmux` by hand works fine for watching a build:
+#
+#     AIOS_SPLIT=1 aios          two panes, agent on top
+#     manual                     this machine's manual
+#     manual minimize            just the sections about minimizing
+set -u
+
+AIOS_ROOT="${AIOS_ROOT:-/aios}"
+export PYTHONPATH="$AIOS_ROOT"
+export PYTHONDONTWRITEBYTECODE=1
+cd "$AIOS_ROOT" || exit 1
+
+# Applying an update before the session starts is what makes "no reboot" true: new
+# code is picked up by the next login, not by a pod restart. Never fatal — a machine
+# that cannot reach its peer must still let you in.
+if [ "${AIOS_AUTOUPDATE:-1}" = 1 ] && [ -n "${AIOS_UPDATE_URL:-}" ]; then
+    python3 -m aios.update apply 2>&1 | sed 's/^/  update: /' || true
+fi
+
+# The machine names its operator, once, and remembers it.
+AIOS_OPERATOR=$(python3 -m aios.identity --account 2>/dev/null || echo operator)
+export AIOS_OPERATOR
+
+# Opt-in only. Kept because intent[3] asked for it and its probe passes; not the
+# default because the default has to be somewhere you can simply type.
+if [ "${AIOS_SPLIT:-0}" = 1 ] && command -v tmux >/dev/null 2>&1; then
+    CONF=/etc/aios/tmux.conf
+    SESSION="${AIOS_SESSION:-aios}"
+    if tmux -f "$CONF" has-session -t "$SESSION" 2>/dev/null; then
+        exec tmux -f "$CONF" attach-session -t "$SESSION"
+    fi
+    tmux -f "$CONF" new-session -d -s "$SESSION" -n machine \
+        "python3 -m aios.welcome; exec python3 -m aios.agent"
+    tmux -f "$CONF" split-window -t "$SESSION:machine" -v -p 35 "cd $AIOS_ROOT; exec bash -l"
+    tmux -f "$CONF" select-pane -t "$SESSION:machine.0"   # prompt on top, focused
+    exec tmux -f "$CONF" attach-session -t "$SESSION"
+fi
+
+python3 -m aios.welcome
+exec python3 -m aios.agent "$@"

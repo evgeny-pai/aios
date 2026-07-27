@@ -1,0 +1,49 @@
+name        = "vim"
+description = "Editing over ssh: buffers, ex commands, syntax engine. No GUI, no clipboard."
+atoms       = ["app-editors/vim"]
+
+# Each check runs under `bash -e` in a scratch dir exported as $T.
+# These assert the capabilities intent[0] claims — nothing else. A feature no
+# check here exercises is, by definition, one `forge minimize` may remove.
+
+[[check]]
+name = "edits a file non-interactively"
+script = '''
+printf 'alpha\nbeta\ngamma\n' > "$T/f.txt"
+vim -es -c '2d' -c 'wq' "$T/f.txt"
+grep -qx alpha "$T/f.txt"
+grep -qx gamma "$T/f.txt"
+! grep -qx beta "$T/f.txt"
+'''
+
+[[check]]
+name = "syntax engine is compiled in"
+script = '''
+vim --version | grep -q '+syntax'
+'''
+
+[[check]]
+name = "handles multiple buffers"
+script = '''
+printf 'one\n' > "$T/a.txt"
+printf 'two\n' > "$T/b.txt"
+vim -es -c 'bnext' -c '%s/two/TWO/' -c 'wq' "$T/a.txt" "$T/b.txt"
+grep -qx TWO "$T/b.txt"
+grep -qx one "$T/a.txt"
+'''
+
+[[check]]
+name = "reads a vimrc"
+script = '''
+printf 'set shiftwidth=3\n' > "$T/vimrc"
+vim -u "$T/vimrc" -es -c 'if &shiftwidth != 3 | cquit | endif' -c 'quit' /dev/null
+'''
+
+# Deliberately asserted absent: an intent said "no X11, no clipboard", so a build
+# that grew them back is a regression, not a bonus.
+[[check]]
+name = "no X11 or clipboard support"
+script = '''
+vim --version | grep -q '\-clipboard'
+! vim --version | grep -q '+gui'
+'''

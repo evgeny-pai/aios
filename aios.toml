@@ -1,0 +1,47 @@
+# AIos machine spec. Describe what you do; forge decides what to compile.
+
+[system]
+name     = "aios-dev"
+arch     = "aarch64"           # aarch64 | x86_64
+libc     = "musl"              # musl | glibc
+init     = "dinit"             # no systemd
+profile  = "default"
+cflags   = "-O2 -pipe"
+makeopts = "-j8"
+
+# buildpkg is load-bearing, not an optimisation: forge minimize rebuilds a package
+# once per lever, and a node serves its binary packages to the rest of the network.
+# The sandbox set is off because this machine is a container — portage's ipc/pid/
+# network sandboxes call unshare(), which a stock pod cannot do:
+#   Unable to unshare: EPERM (for FEATURES="pid-sandbox")
+# and userpriv then fails to chmod files it does not own. On real hardware, drop the
+# negations; this line describes THIS machine, which is the point of the spec.
+features = "buildpkg parallel-fetch -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox"
+
+[agent]
+provider = "anthropic"         # anthropic | openai | ollama | echo
+model    = ""                  # empty = provider default
+effort   = "medium"            # low | medium | high | xhigh | max
+
+# Each intent is one thing you actually do. Name the probes that prove it still
+# works — an intent with no probes can be lowered, but never minimized against.
+
+[[intent]]
+text   = "edit code over ssh: syntax highlighting, multiple buffers, no X11 and no clipboard integration"
+probes = ["vim"]
+
+[[intent]]
+text   = "build small C projects locally with make"
+probes = []
+
+[[intent]]
+text   = "reach the machine over ssh with key auth only, no password auth, no X forwarding"
+probes = []
+
+[[intent]]
+text   = "never block the terminal on a long build: a terminal multiplexer that starts split into two panes, so a compile can run in one while I keep working in the other. Scriptable session and pane control from the shell. No mouse, no clipboard, no X."
+probes = ["tmux"]
+
+[[intent]]
+text   = "serve this machine's ebuild tree and binary packages to other AIos nodes over HTTP, and take code updates from a peer the same way"
+probes = []

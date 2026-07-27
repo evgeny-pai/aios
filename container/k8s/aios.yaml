@@ -1,0 +1,127 @@
+# The AIos machine, as a pod.
+#
+# A Pod rather than a Deployment on purpose: this is one machine with an identity,
+# not a replicable stateless workload. Rescheduling it somewhere else and calling
+# it the same machine would be a lie.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aios
+  labels:
+    aios.dev/managed: "true"
+---
+# NOTE: the agent's credentials are deliberately NOT declared here.
+#
+# An earlier version of this file shipped the Secret with `ANTHROPIC_API_KEY: ""`,
+# which meant every `kubectl apply` — including every run of container/build.sh —
+# silently reset the key to empty and the agent quietly went offline. A manifest
+# that destroys user state each time it is applied is worse than no manifest.
+#
+# Create it out-of-band instead; `envFrom` below is marked optional, so the machine
+# boots with or without it:
+#
+#   kubectl -n aios create secret generic aios-agent \
+#     --from-literal=ANTHROPIC_API_KEY=sk-ant-...
+#   kubectl -n aios delete pod aios   # envFrom is injected at container start
+#
+---
+# /aios is the machine's own source of truth — spec, lockfile, journal, overlay.
+# On real hardware this is the data partition that survives both root slots
+# (DESIGN.md §5); here it is a PVC for the same reason: generations come and go,
+# the machine's description persists.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aios-state
+  namespace: aios
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 4Gi
+---
+# The first node to sync becomes the seed of the network: it holds the ebuild tree,
+# the binary package cache, and the source releases its peers update from. Every node
+# after it is cheap, which is what makes `forge minimize` — one rebuild per lever —
+# affordable at all.
+#
+# Named aios-repo rather than aios so a peer's config never has to know which node is
+# currently serving; move the label and the name follows.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aios-repo
+  namespace: aios
+spec:
+  selector:
+    app: aios
+    aios.dev/role: repo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aios
+  namespace: aios
+  labels:
+    app: aios
+    # This node serves the tree. Remove the label to take it out of rotation without
+    # deleting anything.
+    aios.dev/role: repo
+spec:
+  # A machine that self-modifies must not be silently replaced when it exits.
+  restartPolicy: OnFailure
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: aios
+      image: aios:latest
+      imagePullPolicy: Never # loaded into the node with `kind load`, never fetched
+      # A real terminal, so `kubectl attach` and `kubectl exec -it` get a tty and
+      # the welcome screen renders with colour instead of raw escape codes.
+      tty: true
+      stdin: true
+      stdinOnce: false
+      env:
+        # Deliberately NO AIOS_PROVIDER / AIOS_MODEL here. Those env vars override
+        # aios.toml, so setting them made the spec unchangeable from inside the
+        # machine: an agent editing `[agent] provider` saw its own edit have no
+        # effect and looped trying to work out why. The spec is the source of truth;
+        # the env vars stay available as a deliberate operator override.
+        - name: TERM
+          value: xterm-256color
+        - name: COLORTERM
+          value: truecolor
+      envFrom:
+        # optional: the pod must boot when no credentials have been created yet,
+        # and must never be blocked from starting by their absence.
+        - secretRef:
+            name: aios-agent
+            optional: true
+      volumeMounts:
+        - name: state
+          mountPath: /aios/.aios
+      resources:
+        # A stage3 with a toolchain wants room to compile; 4Gi is enough for a
+        # single package at -j2 and leaves headroom on a 12Gi colima VM.
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "3"
+          memory: 4Gi
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        # emerge needs to write across the filesystem, and the whole point is a
+        # machine that rebuilds itself. Confinement is the cluster boundary here.
+        readOnlyRootFilesystem: false
+        allowPrivilegeEscalation: true
+        capabilities:
+          drop: [NET_RAW]
+  volumes:
+    - name: state
+      persistentVolumeClaim:
+        claimName: aios-state

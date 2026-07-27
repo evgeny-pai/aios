@@ -1,0 +1,50 @@
+#!/bin/sh
+# `manual` — read this machine's manual.
+#
+# Installed as /usr/local/bin/manual. Not a man page: the manual is Markdown that
+# also ships in the repo, and maintaining a second roff copy of it would guarantee
+# the two disagree. A pager over the real file cannot drift.
+#
+#   manual            the whole thing
+#   manual minimize   only sections whose heading matches "minimize"
+#   PAGER=cat manual  no pager at all
+set -u
+
+DOC="${AIOS_ROOT:-/aios}/MANUAL.md"
+
+if [ ! -r "$DOC" ]; then
+    echo "manual: no $DOC on this machine." >&2
+    echo "        It ships in the image; a node built before it existed will not" >&2
+    echo "        have it until it takes an update:  python3 -m aios.update apply" >&2
+    exit 1
+fi
+
+# -R keeps colour, -F quits if it fits on one screen, -X leaves it on the terminal
+# afterwards. All three matter in a kubectl exec session — and all three are
+# less-only, so they are chosen by which pager is actually in use rather than
+# assumed. Passing them blindly is how `PAGER=cat manual` came back with
+# "cat: invalid option -- 'R'".
+page() {
+    pager="${PAGER:-less}"
+    case "${pager##*/}" in
+        less) "$pager" -R -F -X ;;
+        *) "$pager" ;;
+    esac
+}
+
+if [ "$#" -gt 0 ]; then
+    # Section-scoped, so `manual probe` answers a question instead of dumping the
+    # file. Prints each matching heading and everything under it, up to the next
+    # heading at the same or a shallower level.
+    awk -v want="$1" '
+        /^#+ / {
+            level = index($0, " ")
+            if (tolower($0) ~ tolower(want)) { show = 1; depth = level }
+            else if (show && level <= depth) { show = 0 }
+        }
+        show { print }
+    ' "$DOC" | page
+    exit 0
+fi
+
+page < "$DOC"
