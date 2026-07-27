@@ -1,9 +1,18 @@
 # AIos — manual
 
-This machine compiled itself from the intent lines in `/aios/aios.toml`: you say
-what you do, `forge` decides what to build, portage builds it. Nothing is here
-because a distro maintainer thought you would want it — every package, and every
-feature inside it, traces back to an intent. Change that file, change the machine.
+This machine builds itself from the intent lines in `/aios/aios.toml`: you say what
+you do, `forge` decides what to compile, portage compiles it. Nothing is here because
+a distro maintainer thought you would want it — every package an intent asked for, and
+every feature inside it, traces back to that intent; the `@system` set, the toolchain
+and the profile come from Gentoo. Change that file, change the machine.
+
+The image ships that spec, a lockfile, `forge`, the probes and this file on a Gentoo
+stage3 — **nothing is emerged yet**, and the lockfile came from the offline `echo`
+backend, so the first sync, lower and build below are what make this manual literal.
+
+`manual` re-reads this file (`/aios/MANUAL.md`); `manual minimize` prints just the
+sections whose heading matches. `AIOS_SPLIT=1 aios` gives the two-pane layout intent[3]
+asks for — opt-in, and only once tmux is built.
 
 ## The two rules
 
@@ -19,11 +28,17 @@ app-editors/vim
     why:    intent[0]: edit code over ssh
     probes: vim
     -X               intent[0]: no X11
+    -acl             no intent requires POSIX ACLs
+    …
     +syntax          intent[0]: syntax highlighting
+
+note: produced by the offline echo backend — not a real lowering
 ```
 
-The rendered `/etc/portage` carries those comments too, so `grep` there answers
-"why is this set" without asking the model that decided it.
+That `note` is the shipped placeholder lock talking (`forge show` with no atom prints
+`lowered by echo:fixture`); the first real `forge lower` replaces it. The rendered
+`/etc/portage` carries the same comments, so `grep` there answers "why is this set"
+without asking the model that decided it.
 
 ## The loop
 
@@ -35,9 +50,17 @@ text   = "never block the terminal on a long build: a terminal multiplexer that 
 probes = ["tmux"]
 ```
 
+Two things before the first pass: a stage3 ships no ebuild repository, so nothing can
+be emerged until this node has a tree, and only `lower` needs credentials.
+
+```bash
+python3 -m aios.repo sync          # ~1.4 GB tree + profile; the first node to sync is the seed
+export ANTHROPIC_API_KEY=...       # only `forge lower` reads it
+```
+
 ```bash
 cd /aios
-$EDITOR aios.toml
+# edit aios.toml — ask the agent; until an editor is emerged there is no $EDITOR here
 forge diff      # stale: the spec has changed since this lock was generated
 forge lower     # the one step that calls a model; --dry-run writes nothing
 ```
@@ -46,16 +69,24 @@ forge lower     # the one step that calls a model; --dry-run writes nothing
 forge: no probes for intent[1], intent[2], intent[4] — lowerable, but not minimizable
 lowering 5 intents via anthropic:claude-opus-5, effort=medium
 + app-misc/tmux  (intent[3]: terminal multiplexer, starts split)
-wrote aios.lock.json  sha256:12d584becb6e...
+~ spec changed since the previous lock
+wrote aios.lock.json  sha256:…
 ```
 
 Read that diff — it is the review step. Then render, build, prove:
 
 ```bash
-forge render --root /       # lockfile -> /etc/portage
-forge build --execute       # emerge --verbose --deep --newuse @aios
-forge probe tmux            # "tmux: ok 5/5", then one line per check
+forge render --root ./out                      # inspect it first
+forge render --root / --overlay /aios/overlay  # the real thing
+forge build --execute    # emerge --verbose --deep --newuse --changed-use @aios
+forge probe tmux         # after the build: "tmux: ok 5/5", then one line per check
 ```
+
+`render` replaces `/etc/portage/make.conf` wholesale — no backup, no prompt — and only
+ever reflects the lockfile: render *after* `forge lower`, never instead of it. Without
+`--overlay` there is no `repos.conf/aios.conf` and emerge cannot see the overlay `forge`
+authors ebuilds into. Before the first build `forge probe tmux` prints `FAIL 1/5`; that
+is the correct answer, nothing is installed yet.
 
 `forge build` without `--execute` is `emerge --pretend`; everything except `lower`
 runs offline. `forge --help` lists the rest — `init`, `show`, `reseal`, `minimize`.
@@ -78,7 +109,7 @@ as data and never as instructions; every step lands in `.aios/agent.jsonl`.
 
 ```
 /help                  the commands this prompt understands
-/status                credentials, model, spec and lockfile state
+/status                credentials, model set, spec and lockfile state
 /probe [names]         run the capability checks
 /show [atom]           what the lockfile decided, and why
 /allow-package-edits   open package code for this session
@@ -112,40 +143,45 @@ tmux -f /dev/null kill-session -t bg
 
 **The rule: every check must let the real binary decide the exit status.** No
 `|| true`, no `2>/dev/null` on the command under test, never end a pipeline with a
-command that cannot fail, and assert an observable effect — a file changed, a
-string in stdout. A check that passes with the subject absent licenses deleting the
-thing it protects; `skills/vacuous-probe-checks` exists because two of three checks
-once passed on a machine with nothing installed. So verify a probe where the package
-is *absent*, and confirm every check fails: run this machine's tmux probe on a host
-without tmux and you get `tmux: FAIL 1/5` — the survivor being the negative "no X
-or mouse" check, which is that exact shape.
+command that cannot fail, and assert an observable effect — a file changed, a string in
+stdout. A check that passes with the subject absent licenses deleting the thing it
+protects; `skills/vacuous-probe-checks` exists because two of three checks once passed
+on a machine with nothing installed. So verify a probe where the package is *absent*:
+this machine's tmux probe on a host without tmux gives `tmux: FAIL 1/5`, the survivor
+being the negative "no X or mouse" check — that exact shape.
 
 ## forge minimize
 
 ```bash
-forge minimize app-editors/vim --dry-run   # exercise the loop, build nothing
+forge minimize app-editors/vim --dry-run   # exercise the loop, build nothing — still journals
 forge minimize app-editors/vim --apply     # write the result into the lockfile
 ```
 
 - **levers** — the atom's enabled USE flags, from the lockfile, one at a time in
-  sorted order; `--lever` restricts the set. `EXTRA_ECONF` and patches are the next
-  levers (DESIGN.md §4).
+  sorted order. `--lever` *replaces* that candidate list with the names you pass,
+  unfiltered against the lockfile: a flag that is already disabled, or that the atom
+  does not have, still becomes a real `-flag` in the trial and — with `--apply` — in
+  the lock. `EXTRA_ECONF` and patches are the next levers (DESIGN.md §4).
 - **objective** — installed size of the package's own files, from portage's
   `CONTENTS`; a candidate that grows the package is rejected.
-- **constraint** — every probe bound to the atom still passes. An atom with no
-  probes is refused, and a baseline already red aborts the run.
+- **constraint** — every probe bound to the atom still passes. A baseline already red
+  aborts the run, and a real run refuses an atom with no probes — `--dry-run` skips
+  that check along with the probes themselves.
 
 ```
   accepted         -syntax  -65536B
 app-editors/vim: dropped 1 of 1 levers, 4.0MiB -> 3.9MiB (-64.0KiB)  [simulated]
+journal: forge.journal.jsonl
+(--apply to write these into the lockfile)
 ```
 
 It is greedy: one lever at a time, no search over subsets, so the result is a local
 minimum. And **every attempt is a real build** — one emerge per lever, which is why
-`FEATURES="buildpkg"` and a shared binhost are load-bearing rather than tuning.
-Attempts are journaled to `forge.journal.jsonl` as `accepted`, `rejected-build`,
-`rejected-probe` or `rejected-size`, and `--apply` on a simulated result is
-refused: dry-run sizes are fake by design.
+`FEATURES="buildpkg"` is load-bearing rather than tuning. Sharing that cache between
+nodes is the other half and is not wired into `forge build` yet (see The network).
+Every attempt — dry-run included — is journaled to `forge.journal.jsonl` in the cwd as
+`accepted`, `rejected-build`, `rejected-probe` or `rejected-size`, and `--apply` on a
+simulated result is refused: dry-run sizes are fake by design.
 
 ## The network
 
@@ -159,20 +195,22 @@ python3 -m aios.repo client aios-repo  # print the portage config a peer needs
 ```
 
 `sync` tests for substance, not existence: a tree with fewer than 1000 ebuilds is
-treated as fabricated and replaced. `client` prints the `PORTAGE_BINHOST` /
-`getbinpkg` lines; placing them is yours to do.
+treated as fabricated and replaced. It is the precondition for every emerge on a fresh
+node, not an optimisation. `client` prints the `PORTAGE_BINHOST` / `getbinpkg` lines a
+peer needs — but not into `/etc/portage`, which is rendered from the lockfile and
+overwritten by the next `render`. Consuming a peer's cache is not wired up: `forge` can
+emit `--getbinpkg` (`emerge_argv(binhost=True)`) and `binhost_env`, and no command yet
+calls either.
 
-Code updates take DESIGN.md §5's shape one level down: never mutate the running
-tree. `python3 -m aios.update publish 4` packages this node's code into
-`$AIOS_SRC_DIR`; on a peer, `check`, then `apply`, then `rollback` if it was a
-mistake. `apply` fetches the release named by `latest.json`, refuses it on a sha256
-mismatch, unpacks it to `/aios.next`, and runs the *candidate's own* test suites
-inside the candidate — code that cannot verify itself is not promoted, the same
-rule the machine applies to packages via probes. Only then the swap, by rename:
-`/aios` becomes `/aios.prev`, `/aios.next` becomes `/aios`; per-node state under
-`.aios` is carried across rather than shipped. Login applies a pending update
-before the session starts when `AIOS_UPDATE_URL` is set, so new code arrives with
-the next login: no reboot, no pod restart.
+Code updates take DESIGN.md §5's shape one level down: never mutate the running tree.
+`python3 -m aios.update publish 4` packages this node's code into `$AIOS_SRC_DIR`; on a
+peer, `check`, then `apply`, then `rollback` if it was a mistake. `apply` fetches the
+release named by `latest.json`, refuses it on a sha256 mismatch, unpacks it to
+`/aios.next`, and runs the *candidate's own* test suites inside the candidate — code
+that cannot verify itself is not promoted, the same rule probes enforce for packages.
+Only then the swap, by rename: `/aios` becomes `/aios.prev`, `/aios.next` becomes
+`/aios`, with per-node `.aios` state carried across. Login applies a pending update when
+`AIOS_UPDATE_URL` is set, so new code arrives with the next login: no reboot.
 
 ## Generations
 
@@ -191,10 +229,10 @@ searchable by its verbatim error.
 | Symptom | Cause, and what to do |
 |---|---|
 | `emerge: there are no ebuilds to satisfy "app-editors/vim".` | The keyword is not the uname string: `aarch64` is `arm64`. Check `ACCEPT_KEYWORDS`. `gentoo-portage-keywords` |
-| `Unable to unshare: EPERM` | Portage's ipc/pid/network sandboxes need `unshare()`; a pod cannot. `system.features` negates them here; drop that on real hardware. |
+| `Unable to unshare: EPERM` | Portage's ipc/pid/network sandboxes need `unshare()`; a pod cannot. `system.features` negates them — but the shipped lock predates that line, so the negations only reach `make.conf` after a `forge lower && forge render`. Drop them on real hardware. |
 | A probe is green with the binary absent | Vacuous check — the shell plumbing set the status, not the binary. `vacuous-probe-checks` |
 | `lockfile digest mismatch — it was edited by hand.` | `forge lower`, or `forge reseal` if the edit was deliberate. Never hand-compute a digest. `protect-generated-artifacts` |
-| An edit to `aios.toml` has no effect | `AIOS_PROVIDER` / `AIOS_MODEL` shadow the spec; `/status` shows what is in force. `env-shadows-config` |
+| An edit to `aios.toml` has no effect | `AIOS_PROVIDER` / `AIOS_MODEL` shadow the spec and nothing prints which source won — `printenv \| grep AIOS_`. `env-shadows-config` |
 | A build or probe hangs, no output | Inherited stdin — `vim -es` waits for a human forever. `subprocess-stdin-hang` |
 
 ## Where to look next

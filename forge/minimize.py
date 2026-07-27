@@ -132,7 +132,13 @@ class LocalRunner:
 
     def build(self, atom: str, disabled: list[str]) -> BuildResult:
         self._write_trial(atom, disabled)
-        argv = portage_mod.emerge_argv(self.lock, root=self.root, atoms=[atom])
+        # One atom, one flag changed, dozens of times: no dependency graph walk, and
+        # no @world churn. See emerge_argv for why each of those costs real minutes
+        # per lever. binhost is deliberately NOT set — measuring a package means
+        # building it here, and a peer's prebuilt copy would be measuring their build.
+        argv = portage_mod.emerge_argv(
+            self.lock, root=self.root, atoms=[atom], deep=False, oneshot=True
+        )
         started = time.monotonic()
         completed = subprocess.run(argv, capture_output=True, text=True)
         duration = time.monotonic() - started

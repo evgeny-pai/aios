@@ -45,3 +45,10 @@ probes = ["tmux"]
 [[intent]]
 text   = "serve this machine's ebuild tree and binary packages to other AIos nodes over HTTP, and take code updates from a peer the same way"
 probes = []
+
+# forge minimize rebuilds one package once per lever — a dozen near-identical
+# compiles of the same source. A compiler cache is the difference between that being
+# an afternoon and being a coffee break.
+[[intent]]
+text   = "rebuild the same package repeatedly without recompiling what did not change: a compiler cache sized for a few full package builds, shared across every build on this machine"
+probes = ["ccache"]

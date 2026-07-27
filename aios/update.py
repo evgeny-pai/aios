@@ -25,6 +25,7 @@ node to sync becomes the seed of the network.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -45,10 +46,35 @@ STATE = ROOT / ".aios"
 VERSION_FILE = STATE / "code-version"
 MANIFEST = "latest.json"
 
-#: What a node's code actually consists of. Deliberately not the whole directory:
-#: .aios is per-node state on a mounted volume and must never travel in an update.
-PAYLOAD = ("aios", "forge", "probes", "tests", "overlay", "skills",
-           "aios.toml", "README.md", "DESIGN.md")
+#: What a node's code actually consists of. Deliberately not the whole directory,
+#: and the exclusions matter in both directions:
+#:
+#: - `.aios` is per-node state on a MOUNTED volume — the generation counter, the
+#:   operator handle, the agent journal. It must never travel in an update.
+#: - `aios.lock.json` and MANUAL.md were missing from this list, which would have
+#:   made an update DELETE the lockfile from the target. A node without its lock
+#:   cannot render, cannot build, and fails `forge diff`. Found by inspecting a real
+#:   node before pointing this at it, not by a test.
+#: - Anything a node created for itself (notes, scripts, logs) is not listed and is
+#:   therefore left alone. #2 had written AESTHETIC.md, CLI.md, QUICKSTART.md and
+#:   showcase.sh; an update is not entitled to destroy a machine's own work.
+PAYLOAD = ("aios", "forge", "probes", "tests", "overlay", "skills", "container",
+           "aios.toml", "aios.lock.json", "README.md", "DESIGN.md", "MANUAL.md")
+
+#: Files that must land OUTSIDE /aios to have any effect, copied from the payload's
+#: `container/` after a successful swap: source -> destination, mode.
+#:
+#: Without this the update was structurally incapable of delivering the login path,
+#: the boot sequence, or the tmux layout — they live at /sbin and /etc, and PAYLOAD
+#: only reaches /aios. A node took an update that "promoted" every module and still
+#: logged you into the previous cockpit, which is the most confusing possible result:
+#: the new code is present, and nothing you touch runs it.
+INSTALL = (
+    ("container/aios-init", "/sbin/aios-init", 0o755),
+    ("container/aios-login", "/sbin/aios-login", 0o755),
+    ("container/manual", "/usr/local/bin/manual", 0o755),
+    ("container/tmux.conf", "/etc/aios/tmux.conf", 0o644),
+)
 
 #: Run inside a candidate before it may be promoted. Both suites, because an update
 #: that breaks the build tool is as bad as one that breaks the agent.
@@ -193,21 +219,117 @@ def apply(base: str, *, force: bool = False) -> str:
             + "\n  ".join(failures)
         )
 
-    # Carry per-node state across: it belongs to the machine, not to the code.
-    if STATE.exists() and not (STAGE / ".aios").exists():
-        (STAGE / ".aios").symlink_to(STATE)
-
-    if PREVIOUS.exists():
-        shutil.rmtree(PREVIOUS)
-    ROOT.rename(PREVIOUS)
-    STAGE.rename(ROOT)
+    moved = swap_in(STAGE)
+    shutil.rmtree(STAGE, ignore_errors=True)
+    installed_paths, install_errors = install_outside()
 
     STATE.mkdir(parents=True, exist_ok=True)
     VERSION_FILE.write_text(release.sha256 + "\n", encoding="utf-8")
-    return (
-        f"promoted {release.version} ({release.sha256[:12]}); previous tree kept at "
-        f"{PREVIOUS}\nrestart the session to run it: exec aios"
-    )
+    lines = [
+        f"promoted {release.version} ({release.sha256[:12]}): {', '.join(moved)}",
+        f"installed: {', '.join(installed_paths) or 'nothing outside /aios'}",
+    ]
+    if install_errors:
+        # Loud, because the machine now runs new modules behind an old login path.
+        lines.append("COULD NOT INSTALL (the login path may still be the old one):")
+        lines += [f"  {problem}" for problem in install_errors]
+    lines += [
+        f"previous copies kept at {PREVIOUS} — `aios.update rollback` restores them",
+        "restart the session to run it: exec aios",
+    ]
+    return "\n".join(lines)
+
+
+def install_outside(root: Path | None = None) -> tuple[list[str], list[str]]:
+    """Put the boot, login and layout files where the system actually reads them.
+
+    Copied rather than moved, so /aios/container stays a faithful record of what this
+    node was given — and copied per file, so a read-only /sbin costs you that one file
+    and a clear message, not the whole update.
+    """
+    root = root or ROOT
+    done: list[str] = []
+    problems: list[str] = []
+    for relative, destination, mode in INSTALL:
+        source = root / relative
+        if not source.is_file():
+            problems.append(f"{relative} missing from the payload")
+            continue
+        target = Path(destination)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Write via a sibling temp then replace: the login script may be the very
+            # file a session is about to exec, and a half-written one is unrunnable.
+            staged = target.with_name(target.name + ".incoming")
+            shutil.copyfile(source, staged)
+            staged.chmod(mode)
+            staged.replace(target)
+            done.append(destination)
+        except OSError as exc:
+            problems.append(f"{destination}: {exc}")
+    return done, problems
+
+
+def swap_in(stage: Path) -> list[str]:
+    """Move each payload entry into place, one rename at a time.
+
+    ROOT is never renamed, and that is not a stylistic choice. On a real node
+    `/aios/.aios` is a mount point (`/dev/vdb1 … type ext4`), and renaming a
+    directory that contains a mount fails with EBUSY — so the obvious
+    "rename the tree aside, move the new one in" would have failed on every machine
+    that actually has persistent state, which is all of them.
+
+    Swapping per entry has a second and better property: files this node created for
+    itself are not in PAYLOAD, so they are neither moved nor deleted. An update
+    replaces the code it shipped and nothing else.
+
+    The gate has already passed by the time this runs, so a partial swap means the
+    filesystem failed under us rather than the code being bad; the displaced copies
+    in PREVIOUS are what `rollback()` puts back.
+    """
+    PREVIOUS.mkdir(parents=True, exist_ok=True)
+    moved: list[str] = []
+    for item in PAYLOAD:
+        incoming = stage / item
+        if not incoming.exists():
+            continue
+        target = ROOT / item
+        kept = PREVIOUS / item
+        _remove(kept)
+        if target.exists():
+            _move(target, kept)
+        _move(incoming, target)
+        moved.append(item)
+    return moved
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    elif path.exists() or path.is_symlink():
+        path.unlink(missing_ok=True)
+
+
+def _move(src: Path, dst: Path) -> None:
+    """Rename when the filesystem allows it; copy when it does not.
+
+    Two real failures on the same machine taught this, both reported as
+    `OSError: [Errno 18] Cross-device link` despite both paths being on one mount:
+
+      /aios       -> /aios.prev        because /aios contains a mounted volume
+      /aios/aios  -> /aios.prev/aios   because overlayfs cannot rename a directory
+                                       that still lives in the image's lower layer
+
+    So a directory rename is not a primitive you can rely on inside a container.
+    `shutil.move` falls back to copy-then-delete on EXDEV: slower, and correct. The
+    destination is always removed first, or move would nest inside it.
+    """
+    try:
+        src.rename(dst)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        shutil.move(str(src), str(dst))
 
 
 def gate(candidate: Path) -> list[str]:
@@ -231,16 +353,30 @@ def gate(candidate: Path) -> list[str]:
 
 
 def rollback() -> str:
+    """Put back whatever the last apply displaced, entry by entry.
+
+    Mirrors swap_in for the same reason: ROOT cannot be renamed on a node with a
+    mounted state volume.
+    """
     if not PREVIOUS.is_dir():
         raise UpdateError(f"nothing to roll back to — {PREVIOUS} does not exist")
-    scratch = Path(f"{ROOT}.rollback")
-    if scratch.exists():
-        shutil.rmtree(scratch)
-    ROOT.rename(scratch)
-    PREVIOUS.rename(ROOT)
-    shutil.rmtree(scratch)
+
+    restored: list[str] = []
+    for item in PAYLOAD:
+        kept = PREVIOUS / item
+        if not kept.exists():
+            continue
+        target = ROOT / item
+        _remove(target)
+        _move(kept, target)
+        restored.append(item)
+
+    if not restored:
+        raise UpdateError(f"{PREVIOUS} holds none of the payload — nothing to restore")
     VERSION_FILE.unlink(missing_ok=True)
-    return f"rolled back to the tree in {PREVIOUS}; restart the session to run it"
+    return (
+        f"rolled back: {', '.join(restored)}\nrestart the session to run it: exec aios"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

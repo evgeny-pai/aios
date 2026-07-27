@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from . import binpkg as binpkg_mod
 from . import lock as lock_mod
 from . import lower as lower_mod
 from . import minimize as minimize_mod
@@ -33,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.handler(args) or 0
     except (Fail, spec_mod.SpecError, lock_mod.LockError, probe_mod.ProbeError,
             provider_mod.ProviderError, lower_mod.LoweringError,
-            minimize_mod.MinimizeError) as exc:
+            minimize_mod.MinimizeError, binpkg_mod.BinpkgError) as exc:
         print(f"forge: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -81,7 +83,21 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("build", help="emerge the lockfile's package set")
     p.add_argument("--root", default="/", help="build into this root")
     p.add_argument("--execute", action="store_true", help="really build (default is --pretend)")
+    p.add_argument("--peer", default="", help="reuse a peer's binary packages, e.g. http://aios-repo:8080/binpkgs (env: AIOS_BINHOST). Prebuilt packages whose USE flags disagree with the lock are rejected, not installed")
     p.set_defaults(handler=cmd_build)
+
+    p = sub.add_parser(
+        "binpkg",
+        help="does a prebuilt package fit this lockfile?",
+        description="Compare built binary packages against the lockfile's decisions. "
+                    "Reads metadata only — never the image. Exits non-zero unless every "
+                    "package is reusable here.",
+    )
+    p.add_argument("paths", nargs="*", help="package files (.gpkg.tar, .tbz2)")
+    p.add_argument("--dir", default="", help=f"walk a binpkg cache (e.g. {binpkg_mod.DEFAULT_PKGDIR})")
+    p.add_argument("--peer", default="", help="a peer's binhost URL, or one package URL over HTTP")
+    p.add_argument("--atom", default="", help="compare against this lock entry instead of the package's own")
+    p.set_defaults(handler=cmd_binpkg)
 
     p = sub.add_parser("probe", help="run capability checks")
     p.add_argument("names", nargs="*", help="probe names (default: every probe in the spec)")
@@ -219,7 +235,19 @@ def cmd_render(args) -> int:
 
 def cmd_build(args) -> int:
     lock = lock_mod.load(args.lock)
-    argv = portage_mod.emerge_argv(lock, root=args.root, pretend=not args.execute)
+    peer = args.peer or os.environ.get("AIOS_BINHOST", "")
+    argv = portage_mod.emerge_argv(
+        lock, root=args.root, pretend=not args.execute, binhost=bool(peer)
+    )
+    env = None
+    if peer:
+        # A peer's binary packages are an accelerator, never an authority: portage
+        # still resolves the graph from the rendered lockfile, and --binpkg-respect-use
+        # makes it reject any prebuilt package whose flags disagree and build from
+        # source instead. So reuse can save time but cannot change what you get.
+        env = {**os.environ, **portage_mod.binhost_env(peer)}
+        print(f"reusing binary packages from {peer} where the USE flags match",
+              file=sys.stderr)
     if shutil.which("emerge") is None:
         print("emerge is not on PATH — this host cannot build. Would run:")
         print("  " + " ".join(argv))
@@ -227,7 +255,31 @@ def cmd_build(args) -> int:
     if not args.execute:
         print("(--pretend; pass --execute to build)", file=sys.stderr)
     print("+ " + " ".join(argv), file=sys.stderr)
-    return subprocess.run(argv).returncode
+    return subprocess.run(argv, env=env).returncode
+
+
+def cmd_binpkg(args) -> int:
+    lock = lock_mod.load(args.lock)
+    sources = list(args.paths)
+    if args.dir:
+        sources += [str(path) for path in binpkg_mod.walk(args.dir)]
+    if args.peer:
+        sources += binpkg_mod.peer_sources(args.peer)
+    if not sources:
+        raise Fail(
+            "nothing to check — pass package paths, --dir "
+            f"{binpkg_mod.DEFAULT_PKGDIR}, or --peer http://aios-repo:8080/binpkgs"
+        )
+
+    fits = [binpkg_mod.examine(source, lock, atom=args.atom or None) for source in sources]
+    for line in binpkg_mod.render(fits):
+        print(line)
+    # Zero is a prediction that emerge will REUSE these, so it is withheld from
+    # anything portage would rebuild or a reader should not trust: a mismatch, a
+    # foreign build, a package that could not be read, a package whose USE flags are
+    # contradicted by what its binaries link, and one carrying an enabled feature no
+    # intent justified — `--binpkg-respect-use=y` rejects that last one too.
+    return 0 if all(item.ok for item in fits) else 1
 
 
 def cmd_probe(args) -> int:

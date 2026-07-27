@@ -1,8 +1,8 @@
 {
-  "digest": "sha256:12d584becb6e47375992a4a033b94d95fe268802ada20633a48e75c640e80fe6",
+  "digest": "sha256:b87e4a1dafc51cbfc0c260fd3b109ecae5346421ba77e63747cefa3810d438d0",
   "generated_by": {
-    "model": "fixture",
-    "provider": "echo"
+    "model": "claude-opus-5",
+    "provider": "anthropic"
   },
   "intents": [
     {
@@ -18,6 +18,22 @@
     {
       "probes": [],
       "text": "reach the machine over ssh with key auth only, no password auth, no X forwarding"
+    },
+    {
+      "probes": [
+        "tmux"
+      ],
+      "text": "never block the terminal on a long build: a terminal multiplexer that starts split into two panes, so a compile can run in one while I keep working in the other. Scriptable session and pane control from the shell. No mouse, no clipboard, no X."
+    },
+    {
+      "probes": [],
+      "text": "serve this machine's ebuild tree and binary packages to other AIos nodes over HTTP, and take code updates from a peer the same way"
+    },
+    {
+      "probes": [
+        "ccache"
+      ],
+      "text": "rebuild the same package repeatedly without recompiling what did not change: a compiler cache sized for a few full package builds, shared across every build on this machine"
     }
   ],
   "make_conf": [
@@ -25,6 +41,21 @@
       "key": "ACCEPT_KEYWORDS",
       "value": "arm64",
       "why": "spec: system.arch"
+    },
+    {
+      "key": "BINPKG_COMPRESS",
+      "value": "zstd",
+      "why": "intent[4]: binary packages are shipped over the network to peers; fast compression keeps transfers small"
+    },
+    {
+      "key": "CCACHE_DIR",
+      "value": "/var/cache/ccache",
+      "why": "intent[5]: one fixed cache location shared by all builds rather than per-user caches"
+    },
+    {
+      "key": "CCACHE_SIZE",
+      "value": "8G",
+      "why": "intent[5]: sized to hold a few full package builds"
     },
     {
       "key": "CFLAGS",
@@ -43,8 +74,8 @@
     },
     {
       "key": "FEATURES",
-      "value": "buildpkg",
-      "why": "minimization rebuilds packages repeatedly; cache them"
+      "value": "buildpkg parallel-fetch -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox",
+      "why": "spec: system.features"
     },
     {
       "key": "MAKEOPTS",
@@ -52,14 +83,26 @@
       "why": "spec: system.makeopts"
     },
     {
+      "key": "PKGDIR",
+      "value": "/var/cache/binpkgs",
+      "why": "intent[4]: stable path for the binary package directory that nginx exports over HTTP"
+    },
+    {
       "key": "USE",
-      "value": "-X -gtk -gnome -kde -qt5 -wayland -systemd -nls",
-      "why": "no intent implies a graphical session or localization"
+      "value": "-X -wayland -gtk -qt5 -qt6 -systemd -pam -nls -bluetooth -cups -pulseaudio -alsa ssl",
+      "why": "intent[0]/intent[3]: no X11, no clipboard, no graphical session; intent[2]: no PAM since password auth is off; ssl kept globally because intent[2] key auth and intent[4] fetching need a crypto backend"
     }
   ],
   "minimized": {},
   "notes": [
-    "produced by the offline echo backend — not a real lowering"
+    "intent[1] (build small C projects with make): sys-devel/make, binutils and the compiler come from @system and the profile's toolchain, so no package is listed. Nothing extra is required.",
+    "intent[1], intent[2] and intent[4] have no probes, so the packages bound to them (openssh, nginx, git) can never be minimized away automatically.",
+    "No X-forwarding USE flag exists for net-misc/openssh; disabling X11Forwarding in sshd_config is a config-file decision for the renderer, not a build flag. Same for 'PasswordAuthentication no' / 'PubkeyAuthentication yes'.",
+    "tmux has no mouse or clipboard USE flag; 'no mouse, no clipboard' from intent[3] is enforced in tmux.conf (set -g mouse off, no set-clipboard), not at build time. The two-pane startup layout is likewise a tmux.conf/session-script concern.",
+    "intent[4] 'serve the ebuild tree over HTTP': nginx serving /var/db/repos/gentoo and PKGDIR as static directories covers this; if rsync export were wanted instead, net-misc/rsync would be needed — not added since HTTP was specified.",
+    "musl target: none of the listed packages are known to be glibc-only. app-editors/vim, app-misc/tmux, net-misc/openssh, dev-util/ccache, www-servers/nginx and dev-vcs/git all build on musl. nginx with certain third-party modules can need glibc-specifics; only the core static/autoindex modules are enabled here.",
+    "Assumed the peer code updates in intent[4] arrive as a git repository over HTTP. If they arrive as a plain rsync/HTTP snapshot instead, dev-vcs/git is unnecessary and should be dropped.",
+    "discarded agent-proposed FEATURES='ccache buildpkg parallel-fetch': spec-owned (kept 'buildpkg parallel-fetch -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox')"
   ],
   "packages": [
     {
@@ -72,45 +115,152 @@
         {
           "enabled": false,
           "flag": "X",
-          "why": "intent[0]: no X11"
+          "why": "intent[0]: explicitly no X11 and no clipboard integration"
         },
         {
           "enabled": false,
           "flag": "acl",
-          "why": "no intent requires POSIX ACLs"
+          "why": "no intent asks for ACL preservation on save"
         },
         {
           "enabled": false,
-          "flag": "gui",
-          "why": "intent[0]: no X11"
+          "flag": "cscope",
+          "why": "no intent asks for cscope code navigation"
+        },
+        {
+          "enabled": false,
+          "flag": "gpm",
+          "why": "no intent asks for console mouse support"
+        },
+        {
+          "enabled": false,
+          "flag": "lua",
+          "why": "no intent asks for lua plugin support"
+        },
+        {
+          "enabled": false,
+          "flag": "minimal",
+          "why": "intent[0]: syntax highlighting and multi-buffer support require the full build, not the minimal one"
         },
         {
           "enabled": false,
           "flag": "nls",
-          "why": "no intent requires localization"
+          "why": "no intent asks for localized messages"
         },
         {
           "enabled": false,
           "flag": "perl",
-          "why": "no intent requires perl scripting"
+          "why": "no intent asks for perl scripting in the editor"
         },
         {
           "enabled": false,
           "flag": "python",
-          "why": "no intent requires python scripting"
+          "why": "no intent asks for python plugin support"
         },
         {
           "enabled": false,
           "flag": "ruby",
-          "why": "no intent requires ruby scripting"
+          "why": "no intent asks for ruby plugin support"
         },
         {
-          "enabled": true,
-          "flag": "syntax",
-          "why": "intent[0]: syntax highlighting"
+          "enabled": false,
+          "flag": "tcl",
+          "why": "no intent asks for tcl plugin support"
+        },
+        {
+          "enabled": false,
+          "flag": "terminal",
+          "why": "no intent asks for :terminal inside vim; intent[3] covers multiplexing via tmux"
         }
       ],
-      "why": "intent[0]: edit code over ssh"
+      "why": "intent[0]: edit code over ssh with syntax highlighting and multiple buffers"
+    },
+    {
+      "accept_keywords": [],
+      "atom": "app-misc/tmux",
+      "probes": [
+        "tmux"
+      ],
+      "use": [
+        {
+          "enabled": false,
+          "flag": "debug",
+          "why": "no intent asks for debug builds"
+        },
+        {
+          "enabled": false,
+          "flag": "systemd",
+          "why": "target init is dinit; no intent asks for systemd integration"
+        },
+        {
+          "enabled": false,
+          "flag": "utempter",
+          "why": "no intent asks for utmp/wtmp session records"
+        },
+        {
+          "enabled": false,
+          "flag": "vim-syntax",
+          "why": "no intent asks for tmux.conf syntax files in vim; intent[0] only needs code highlighting"
+        }
+      ],
+      "why": "intent[3]: terminal multiplexer with scriptable session/pane control so a build runs in one pane while work continues in another"
+    },
+    {
+      "accept_keywords": [],
+      "atom": "dev-util/ccache",
+      "probes": [
+        "ccache"
+      ],
+      "use": [],
+      "why": "intent[5]: compiler cache so unchanged translation units are not recompiled"
+    },
+    {
+      "accept_keywords": [],
+      "atom": "dev-vcs/git",
+      "probes": [],
+      "use": [
+        {
+          "enabled": true,
+          "flag": "curl",
+          "why": "intent[4]: HTTP transport for fetching updates from a peer"
+        },
+        {
+          "enabled": false,
+          "flag": "gpg",
+          "why": "no intent asks for signature verification of commits"
+        },
+        {
+          "enabled": false,
+          "flag": "nls",
+          "why": "no intent asks for localization"
+        },
+        {
+          "enabled": false,
+          "flag": "pcre",
+          "why": "no intent asks for PCRE-backed git grep"
+        },
+        {
+          "enabled": false,
+          "flag": "perl",
+          "why": "no intent asks for perl-based git subcommands (git-svn, send-email)"
+        },
+        {
+          "enabled": false,
+          "flag": "python",
+          "why": "no intent asks for python git tooling"
+        },
+        {
+          "enabled": false,
+          "flag": "tk",
+          "why": "intent[0]/intent[3]: no X11 on this machine"
+        },
+        {
+          "enabled": false,
+          "flag": "webdav",
+          "why": "no intent asks for pushing over DAV; updates are pulled"
+        }
+      ],
+      "why": "intent[4]: take code updates from a peer over HTTP (git-over-http clone/pull of an ebuild tree)"
     },
     {
       "accept_keywords": [],
@@ -119,47 +269,93 @@
       "use": [
         {
           "enabled": false,
-          "flag": "X509",
-          "why": "intent[2]: key auth only"
-        },
-        {
-          "enabled": false,
-          "flag": "kerberos",
-          "why": "intent[2]: key auth only"
-        },
-        {
-          "enabled": false,
           "flag": "ldns",
-          "why": "no intent requires SSHFP validation"
+          "why": "no intent asks for SSHFP/DNSSEC host key lookup"
+        },
+        {
+          "enabled": false,
+          "flag": "libedit",
+          "why": "no intent asks for line editing in sftp client"
         },
         {
           "enabled": false,
           "flag": "pam",
-          "why": "intent[2]: no password auth"
+          "why": "intent[2]: no password auth, so no PAM stack needed"
+        },
+        {
+          "enabled": false,
+          "flag": "security-key",
+          "why": "no intent asks for FIDO/U2F hardware keys"
+        },
+        {
+          "enabled": true,
+          "flag": "ssl",
+          "why": "intent[2]: key auth requires crypto backend for standard key types"
+        },
+        {
+          "enabled": false,
+          "flag": "static",
+          "why": "no intent asks for a static sshd"
+        },
+        {
+          "enabled": false,
+          "flag": "xmss",
+          "why": "no intent asks for XMSS keys"
         }
       ],
-      "why": "intent[2]: reach the machine over ssh"
+      "why": "intent[2]: reach the machine over ssh with key auth only"
     },
     {
       "accept_keywords": [],
-      "atom": "sys-devel/make",
+      "atom": "www-servers/nginx",
       "probes": [],
       "use": [
         {
+          "enabled": true,
+          "flag": "http",
+          "why": "intent[4]: HTTP serving is the transport requested"
+        },
+        {
           "enabled": false,
-          "flag": "nls",
-          "why": "no intent requires localization"
+          "flag": "http2",
+          "why": "no intent asks for HTTP/2; plain HTTP static serving suffices"
+        },
+        {
+          "enabled": true,
+          "flag": "nginx_modules_http_autoindex",
+          "why": "intent[4]: rsync/emerge-over-HTTP consumers need directory listings of the tree and binpkg dir"
+        },
+        {
+          "enabled": false,
+          "flag": "nginx_modules_http_fastcgi",
+          "why": "no intent asks for dynamic content"
+        },
+        {
+          "enabled": false,
+          "flag": "nginx_modules_http_gzip",
+          "why": "no intent asks for on-the-fly compression; binpkgs are already compressed"
+        },
+        {
+          "enabled": false,
+          "flag": "nginx_modules_http_proxy",
+          "why": "no intent asks for reverse proxying"
+        },
+        {
+          "enabled": false,
+          "flag": "ssl",
+          "why": "intent[4]: peers are reached over HTTP, not HTTPS"
         }
       ],
-      "why": "intent[1]: build C projects with make"
+      "why": "intent[4]: serve this machine's ebuild tree and binary package directory to other nodes over HTTP"
     }
   ],
   "schema": 1,
-  "spec_digest": "sha256:38b9e4e773514a6c7796109610b0b191fb74a61549d17389ea8eb11fe285f7ca",
+  "spec_digest": "sha256:5fdbcfc429cd766400ae41d166c9b9d62cabcb0bf055400e5b0524ab8be5e8c2",
   "system": {
     "arch": "aarch64",
     "cflags": "-O2 -pipe",
     "chost": "aarch64-unknown-linux-musl",
+    "features": "buildpkg parallel-fetch -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox",
     "init": "dinit",
     "keyword": "arm64",
     "libc": "musl",

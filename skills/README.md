@@ -31,6 +31,13 @@ error text — length buries the fix.
 | [ephemeral-port-exhaustion](ephemeral-port-exhaustion/SKILL.md) | `can't assign requested address` looked like a dead cluster; it was local source-port exhaustion |
 | [kubectl-exec-needs-stdin](kubectl-exec-needs-stdin/SKILL.md) | A heredoc to `kubectl exec` ran nothing and printed nothing — no `-i`, so silence read as success |
 | [detached-agent-loop](detached-agent-loop/SKILL.md) | A never-quit agent in a detached tmux pane kept spending on a red verdict nobody was reading |
+| [tests-must-own-their-stdin](tests-must-own-their-stdin/SKILL.md) | A suite hung three times with no failing test — it inherited stdin and `input()` waited forever |
+| [status-must-report-effective-values](status-must-report-effective-values/SKILL.md) | `/status` printed a module constant, so the one command offered for debugging config shadowing could not see it |
+| [live-state-diverges-from-repo](live-state-diverges-from-repo/SKILL.md) | The pod had a real lockfile; the repo that builds the image still had the offline fixture |
+| [rename-fails-cross-device](rename-fails-cross-device/SKILL.md) | `Errno 18 Cross-device link` on one mount — a contained mount point, then an overlayfs lower layer |
+| [updater-cannot-update-itself](updater-cannot-update-itself/SKILL.md) | The fix for the updater could only arrive via the updater it fixed |
+| [payload-list-is-a-deletion-list](payload-list-is-a-deletion-list/SKILL.md) | The update payload omitted the lockfile, so applying it would have deleted it |
+| [retry-only-transient-failures](retry-only-transient-failures/SKILL.md) | A retry wrapper re-ran a legitimate test-gate failure six times, burying the real error |
 
 ## Adding one
 

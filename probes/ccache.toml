@@ -1,0 +1,49 @@
+name        = "ccache"
+description = "A compiler cache that actually caches — measured by a second compile being a hit."
+atoms       = ["dev-util/ccache"]
+
+# Every check makes ccache itself decide the exit status, and the third one measures
+# the only thing that matters: that a repeated compile is a HIT. A probe asserting
+# "ccache is installed" would pass on a machine where portage never invokes it, which
+# is the vacuous-check failure this repo has already made once
+# (skills/vacuous-probe-checks).
+
+[[check]]
+name = "ccache is installed and reports a version"
+script = '''
+command -v ccache
+ccache --version | grep -qE 'ccache version [0-9]+'
+'''
+
+[[check]]
+name = "a fresh cache reports zero hits"
+script = '''
+export CCACHE_DIR="$T/cache"
+ccache --zero-stats > /dev/null
+ccache --show-stats | grep -qiE 'hit|Hits'
+'''
+
+[[check]]
+name = "compiling the same file twice produces a cache hit"
+script = '''
+export CCACHE_DIR="$T/cache"
+ccache --zero-stats > /dev/null
+printf 'int answer(void) { return 42; }\n' > "$T/u.c"
+
+ccache gcc -O2 -c "$T/u.c" -o "$T/a.o"      # miss, populates the cache
+rm -f "$T/a.o"
+ccache gcc -O2 -c "$T/u.c" -o "$T/a.o"      # must be served from the cache
+
+# ccache 4.x prints "Hits: N", older prints "cache hit". Accept either, but require
+# a non-zero count — "Hits: 0" must fail this check, not pass it.
+stats=$(ccache --show-stats -v 2>/dev/null || ccache --show-stats)
+hits=$(printf '%s\n' "$stats" | grep -iE 'hits?[^0-9]*[0-9]' | grep -oE '[0-9]+' | head -1)
+test -n "$hits" && test "$hits" -ge 1
+test -f "$T/a.o"
+'''
+
+[[check]]
+name = "portage is configured to use it"
+script = '''
+emerge --info 2>/dev/null | grep -oE 'FEATURES="[^"]*"' | grep -q ccache
+'''

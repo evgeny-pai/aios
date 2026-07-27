@@ -21,6 +21,22 @@ DEFAULT_PATH = "aios.lock.json"
 #: and features, not the machine's identity.
 SPEC_OWNED = ("CHOST", "CFLAGS", "CXXFLAGS", "MAKEOPTS", "ACCEPT_KEYWORDS", "FEATURES")
 
+#: Keys the lockfile refuses to carry at all, because they describe the NETWORK
+#: rather than the machine. A live lowering put
+#: `PORTAGE_BINHOST='http://peer.aios.local/binpkgs/'` here — an invented hostname
+#: that resolves nowhere, so every emerge would have stalled on it. Two problems, and
+#: the second is the architectural one: which peers exist is a fact about this
+#: moment, so baking one into the lock makes two nodes with identical specs render
+#: different portage trees, which is precisely the guarantee the lockfile exists to
+#: make. Topology belongs in the environment — `forge build --peer` and
+#: `portage.binhost_env` — where it can be wrong without being permanent.
+FORBIDDEN = {
+    "PORTAGE_BINHOST": (
+        "network topology is not part of the machine's description. Use "
+        "`forge build --peer <url>` or AIOS_BINHOST, which set it per build."
+    ),
+}
+
 
 class LockError(Exception):
     """The lockfile is malformed, stale, or its digest does not match."""
@@ -83,6 +99,11 @@ def build(spec: spec_mod.Spec, lowered: dict, provider: dict) -> dict:
     }
     for entry in lowered.get("make_conf", []):
         key = str(entry["key"]).strip()
+        if key in FORBIDDEN:
+            notes.append(
+                f"refused agent-proposed {key}={entry['value']!r}: {FORBIDDEN[key]}"
+            )
+            continue
         if key in SPEC_OWNED:
             notes.append(
                 f"discarded agent-proposed {key}={entry['value']!r}: spec-owned "

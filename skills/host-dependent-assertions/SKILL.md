@@ -27,4 +27,25 @@ self.assertEqual(verdict.ok, direct.returncode == 0)
 
 When you genuinely need the host, skip loudly: `@unittest.skipUnless(shutil.which("vim"), "needs vim")`. A skip says "not covered"; a failure says "broken". Put the reason in the docstring, where the runner prints it.
 
+## Seen again, two hours later
+
+Same mistake, new test — a role probe asserting the machine had no ebuild tree and no
+listening server, under a temporary root that could not affect either, because both
+are absolute facts about the host:
+
+```python
+os.environ["AIOS_ROOT"] = tmp
+r = node.role()
+self.assertFalse(r.is_seed)          # true on a Mac, FALSE on the seed node
+```
+
+It passed locally and failed on the real node, where `is_seed` was correctly `True`.
+Two things worth taking from the repeat: writing the skill does not stop the habit,
+and the thing that actually caught it was a **release gate running the suite inside
+the target** rather than any amount of local green. Put the gate where the code has
+to run.
+
+Fixed the same way as above: the measured call asserts only "returns without
+raising", and the verdict is asserted against constructed values.
+
 **Verify:** run the suite in the target image — `docker run --rm -v "$PWD:/w:ro" -w /w <image> python3 -m unittest discover -s tests -t .`

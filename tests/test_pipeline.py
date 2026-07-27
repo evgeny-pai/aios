@@ -481,3 +481,73 @@ class TestCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEmergeShapes(unittest.TestCase):
+    """The invocation differs by job, and each difference costs or saves real time."""
+
+    def setUp(self):
+        self.lock = fresh_lock()
+
+    def test_full_build_walks_the_graph(self):
+        argv = portage_mod.emerge_argv(self.lock)
+        self.assertIn("--deep", argv)
+        self.assertNotIn("--oneshot", argv)
+        self.assertIn("--changed-use", argv)
+
+    def test_minimizer_shape_skips_the_graph_and_world(self):
+        argv = portage_mod.emerge_argv(
+            self.lock, atoms=["app-editors/vim"], deep=False, oneshot=True
+        )
+        self.assertNotIn("--deep", argv, "one atom per lever must not re-resolve the graph")
+        self.assertIn("--oneshot", argv, "measuring must not rewrite @world dozens of times")
+        self.assertIn("--changed-use", argv, "the flag flip is the one thing that moved")
+        self.assertIn("app-editors/vim", argv)
+
+    def test_binhost_rejects_mismatched_flags_rather_than_installing_them(self):
+        argv = portage_mod.emerge_argv(self.lock, binhost=True)
+        self.assertIn("--getbinpkg", argv)
+        self.assertIn("--usepkg", argv)
+        # Without this, a peer's vim built +X installs over an intent saying no X11.
+        self.assertIn("--binpkg-respect-use=y", argv)
+
+    def test_binhost_env_keeps_the_peer_out_of_the_lockfile(self):
+        env = portage_mod.binhost_env("http://aios-repo:8080/binpkgs")
+        self.assertEqual(env["PORTAGE_BINHOST"], "http://aios-repo:8080/binpkgs")
+        # Which peers exist is a fact about this moment, not about the machine —
+        # two nodes with the same spec must still render identical portage trees.
+        rendered = portage_mod._make_conf(self.lock)
+        self.assertNotIn("PORTAGE_BINHOST", rendered)
+
+
+class TestForbiddenKeys(unittest.TestCase):
+    """Topology must not reach the lockfile, however plausibly it is proposed."""
+
+    def test_binhost_is_refused_and_the_refusal_is_recorded(self):
+        lowered = {
+            "packages": [{"atom": "app-editors/vim", "why": "intent[0]", "use": [],
+                          "accept_keywords": [], "probes": []}],
+            # Exactly what a live claude-opus-5 lowering proposed. The hostname does
+            # not resolve, and baking any peer in would make two nodes with the same
+            # spec render different portage trees.
+            "make_conf": [
+                {"key": "PORTAGE_BINHOST", "value": "http://peer.aios.local/binpkgs/",
+                 "why": "intent[4]: consume the peer's binhost"},
+            ],
+            "notes": [],
+        }
+        lock = lock_mod.build(SPEC, lowered, {"provider": "echo", "model": "t"})
+        keys = {e["key"] for e in lock["make_conf"]}
+        self.assertNotIn("PORTAGE_BINHOST", keys, "topology may not enter the lock")
+        self.assertTrue(
+            any("refused agent-proposed PORTAGE_BINHOST" in n for n in lock["notes"]),
+            "a refusal must be recorded, not silent",
+        )
+        self.assertTrue(
+            any("--peer" in n for n in lock["notes"]),
+            "the refusal must name the supported route",
+        )
+
+    def test_rendered_make_conf_never_carries_a_peer(self):
+        lock = fresh_lock()
+        self.assertNotIn("PORTAGE_BINHOST", portage_mod._make_conf(lock))

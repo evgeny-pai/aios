@@ -38,7 +38,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import llm, tools, welcome
+from . import llm, node, tools, welcome
 
 LOG_PATH = ".aios/agent.jsonl"
 
@@ -539,6 +539,22 @@ class Agent:
         )
         self.toolset = tools.toolset("orchestrate")
 
+    def _system(self) -> str:
+        """The prompt, plus what this node actually is right now.
+
+        Measured per session rather than written into SYSTEM, because a node's role
+        changes — it starts as a consumer, syncs a tree, begins serving — and a
+        hardcoded paragraph would be wrong the moment it did. It also fixes a real
+        failure: #2 held the only tree on the network and served it, and still called
+        serving "handled separately", because nothing in its context said the network
+        depended on it.
+        """
+        try:
+            return f"{SYSTEM}\n\n{node.briefing()}"
+        except Exception:
+            # A briefing that cannot be measured must not cost the agent its prompt.
+            return SYSTEM
+
     # -- public
 
     def run(self, request: str) -> Result:
@@ -567,7 +583,7 @@ class Agent:
             rounds += 1
             try:
                 answer = self._drive(
-                    self.client, SYSTEM, self.toolset, self.messages, self._remaining(), "main"
+                    self.client, self._system(), self.toolset, self.messages, self._remaining(), "main"
                 )
             except BudgetExhausted as exc:
                 raise self._name_the_red(exc, verdict) from None
@@ -1032,6 +1048,39 @@ def _clip(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+def _lowering_status(root: Path, ink: Ink) -> str:
+    """Which provider and model `forge lower` will actually use, and from where.
+
+    Resolved the same way forge resolves it — spec first, environment overriding —
+    so the answer cannot disagree with what the next lowering does. Shelling out to
+    forge would be more literal still, but /status must stay instant.
+    """
+    provider = model = ""
+    try:
+        from forge import spec as spec_mod
+
+        loaded = spec_mod.load(root / "aios.toml")
+        provider, model = loaded.agent.provider, loaded.agent.model
+    except Exception:
+        pass
+
+    env_provider = os.environ.get("AIOS_PROVIDER")
+    env_model = os.environ.get("AIOS_MODEL")
+    effective_provider = env_provider or provider or "anthropic"
+    effective_model = env_model or model or "provider default"
+
+    shadowed = [
+        name for name, value in (("AIOS_PROVIDER", env_provider), ("AIOS_MODEL", env_model))
+        if value
+    ]
+    where = (
+        ink.warn(f"({', '.join(shadowed)} shadowing aios.toml)")
+        if shadowed
+        else ink.dim("(from aios.toml)")
+    )
+    return f"{effective_provider}:{effective_model} {where}"
+
+
 def _status(root: Path, ink: Ink, package_edits: bool = False) -> str:
     def row(label: str, value: str) -> str:
         return f"  {ink.dim(f'{label:<16}')}{value}"
@@ -1039,11 +1088,23 @@ def _status(root: Path, ink: Ink, package_edits: bool = False) -> str:
     creds = (
         ink.ok("present") if llm.have_credentials() else ink.warn("missing — agent offline")
     )
+    # The EFFECTIVE values, and which source won. This used to print
+    # llm.ORCHESTRATOR unconditionally, so a machine running claude-opus-5 under
+    # AIOS_MODEL reported haiku — and /status was the command the manual sent people
+    # to when "an edit to aios.toml has no effect". skills/env-shadows-config names
+    # "log which source won" as the fix; this is that fix.
+    def sourced(env_var: str, fallback: str, fallback_label: str) -> str:
+        override = os.environ.get(env_var)
+        if override:
+            return f"{override} {ink.warn(f'({env_var} overrides {fallback_label})')}"
+        return f"{fallback} {ink.dim(f'({fallback_label})')}"
+
     lines = [
         row("root", str(root)),
         row("credentials", creds),
-        row("orchestrator", llm.ORCHESTRATOR),
+        row("orchestrator", sourced("AIOS_MODEL", llm.ORCHESTRATOR, "built-in default")),
         row("escalates to", f"{llm.REASONER}, {llm.ARBITER}"),
+        row("lowering", _lowering_status(root, ink)),
         row("package edits", ink.warn("open") if package_edits else ink.ok("refused")),
         row("log", str(root / LOG_PATH)),
     ]

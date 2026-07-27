@@ -3,21 +3,40 @@
 #
 #     kubectl exec -it -n aios aios -- aios
 #
-# Welcome screen, then the agent prompt, directly on this terminal. The prompt is the
-# default surface — the first and only thing you land in.
+# The cockpit: three panes in one window, and you land in the prompt.
 #
-# There was a tmux split here (agent on top, shell below) so a build could not own
-# the terminal. It is gone: detached panes ran the agent's never-quit loop with no
-# human reading it, and a multiplexer you have to escape from is worse than no
-# multiplexer. tmux is still installed and its probe still passes, so it is one env
-# var away if you want it back, and `tmux` by hand works fine for watching a build:
+#   0  left, top      the cockpit's keys, then the agent prompt
+#   1  left, bottom   a root shell, for watching a build
+#   2  right          the dashboard — every agent, what it is doing, and whether
+#                     anything is stuck (python3 -m aios.supervisor)
 #
-#     AIOS_SPLIT=1 aios          two panes, agent on top
+# Pane 0 is about thirteen rows once the status bar and the pane borders are paid
+# for. The welcome manifest is 21 lines and the cheat sheet is 15, so printing both
+# scrolled 22 lines of them away before the prompt appeared and the manifest — the
+# one screen that says why this machine exists — was never actually read in the
+# cockpit. So: the keys here, sized to the pane, and the manifest on F4, in a window
+# of its own at the width it is measured for. AIOS_SPLIT=0 still prints it inline.
+#
+# tmux was taken out of this path once, and for a good reason: the agent's
+# never-quit loop ran in a detached pane with nobody reading it and nothing to stop
+# it (skills/detached-agent-loop). It is back with the brake in the loop rather than
+# in the person watching. The agent has step, wall-clock and identical-verdict
+# budgets. Pane 2's loop is deterministic — it reads .aios/agent.jsonl and redraws,
+# forever, for free — and the one model it may consult is the small one, rate
+# limited, capped for the whole run, and silent while the journal has not changed.
+# So an idle machine costs nothing, and detaching costs nothing.
+#
+#     AIOS_SPLIT=0 aios          no tmux: manifest and prompt on this terminal
+#     AIOS_ADVICE=0 aios         cockpit, dashboard reads only — zero model calls
 #     manual                     this machine's manual
-#     manual minimize            just the sections about minimizing
+#     F4                         the manifest, full width
+#     tmux kill-server           end it all, every pane and client included
 set -u
 
 AIOS_ROOT="${AIOS_ROOT:-/aios}"
+# Exported, not just set: the tmux server inherits this, and the status bar's
+# reader resolves the journal and the generation counter against it.
+export AIOS_ROOT
 export PYTHONPATH="$AIOS_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 cd "$AIOS_ROOT" || exit 1
@@ -33,18 +52,88 @@ fi
 AIOS_OPERATOR=$(python3 -m aios.identity --account 2>/dev/null || echo operator)
 export AIOS_OPERATOR
 
-# Opt-in only. Kept because intent[3] asked for it and its probe passes; not the
-# default because the default has to be somewhere you can simply type.
-if [ "${AIOS_SPLIT:-0}" = 1 ] && command -v tmux >/dev/null 2>&1; then
+# Split, and print the new pane's id.
+#
+# Two things here are version-dependent rather than constant, because this machine
+# compiles its own tmux: the percentage flag changed spelling (`-p N` through 3.0,
+# `-l N%` after), so the current one is tried and the old one is the fallback — a
+# split that silently did not happen would leave the cockpit a pane short. And the
+# id is captured because pane *indices* are positional and shift as panes are
+# inserted, while `%3` names one pane for as long as it lives. Titles are set by id
+# for that reason: a border that says "dashboard" over the shell would be worse
+# than no border at all.
+split() {
+    where=$1
+    percent=$2
+    target=$3
+    shift 3
+    tmux -f "$CONF" split-window "$where" -l "$percent%" -t "$target" \
+        -P -F '#{pane_id}' "$@" 2>/dev/null ||
+        tmux -f "$CONF" split-window "$where" -p "$percent" -t "$target" \
+            -P -F '#{pane_id}' "$@"
+}
+
+# Start a pane's real program, now that the pane has its final size.
+#
+# `send-keys` is the fallback rather than an error, for the same reason `split` has
+# one: a respawn that silently did not happen would leave the human in a bare shell
+# where the agent should be. It works even before the shell is up — the pty buffers
+# what is typed at it until something reads.
+start() {
+    tmux -f "$CONF" respawn-pane -k -t "$1" "$2" 2>/dev/null ||
+        tmux -f "$CONF" send-keys -t "$1" "$2" Enter
+}
+
+if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     CONF=/etc/aios/tmux.conf
     SESSION="${AIOS_SESSION:-aios}"
+    WINDOW="$SESSION:machine"
+
     if tmux -f "$CONF" has-session -t "$SESSION" 2>/dev/null; then
         exec tmux -f "$CONF" attach-session -t "$SESSION"
     fi
-    tmux -f "$CONF" new-session -d -s "$SESSION" -n machine \
-        "python3 -m aios.welcome; exec python3 -m aios.agent"
-    tmux -f "$CONF" split-window -t "$SESSION:machine" -v -p 35 "cd $AIOS_ROOT; exec bash -l"
-    tmux -f "$CONF" select-pane -t "$SESSION:machine.0"   # prompt on top, focused
+
+    # `exec bash -l` at the end of each pane on purpose: /quit, Ctrl-D or a crash in
+    # the dashboard must not collapse the cockpit around a build still running in
+    # pane 1. Leaving for real is C-b d (the machine keeps working) or `tmux
+    # kill-server` (it does not).
+    RUN_PROMPT="python3 -m aios.dashboard keys"
+    RUN_PROMPT="$RUN_PROMPT; python3 -m aios.agent; exec bash -l"
+    RUN_DASH="python3 -m aios.supervisor"
+    RUN_DASH="$RUN_DASH; printf '\n  dashboard stopped — restart: python3 -m aios.supervisor\n'"
+    RUN_DASH="$RUN_DASH; exec bash -l"
+
+    # Every pane starts as a login shell and is respawned with its real command
+    # afterwards, because a program started in a pane that is about to be split
+    # measures the wrong terminal. Both of these read their own size: the cheat sheet
+    # sheds key rows to fit the pane's height, and the dashboard lays out its columns
+    # from the pane's width. Started before the splits, they raced two tmux round
+    # trips — 80 columns when Python won, 49 when tmux did, and tmux reflowing an
+    # 80-column right-aligned panel into 49 shears it.
+    HOLD="exec bash -l"
+    tmux -f "$CONF" new-session -d -s "$SESSION" -n machine "$HOLD"
+    PROMPT=$(tmux -f "$CONF" display-message -p -t "$WINDOW" '#{pane_id}')
+
+    # Order matters. A split inserts the new pane immediately after its target in the
+    # window's pane list, and that list is what pane *indices* count — so taking the
+    # full-height right column first and splitting the left column second lands the
+    # panes on 0 (prompt), 1 (shell), 2 (dashboard), which is what F1/F2/F3 bind to.
+    DASHBOARD=$(split -h 38 "$WINDOW.0" "$HOLD")
+    SHELLPANE=$(split -v 35 "$WINDOW.0" "$HOLD")
+
+    # If any of those ids came back empty, fall back to the indices above rather than
+    # passing an empty target: `-t ""` means *the active pane*, which would put all
+    # three titles on one pane and land the human in the shell instead of the prompt.
+    : "${PROMPT:=$WINDOW.0}" "${SHELLPANE:=$WINDOW.1}" "${DASHBOARD:=$WINDOW.2}"
+
+    # The geometry is final from here. Pane 1 keeps the shell it was born with.
+    start "$DASHBOARD" "$RUN_DASH"
+    start "$PROMPT" "$RUN_PROMPT"
+
+    tmux -f "$CONF" select-pane -t "$PROMPT" -T prompt
+    tmux -f "$CONF" select-pane -t "$SHELLPANE" -T shell
+    tmux -f "$CONF" select-pane -t "$DASHBOARD" -T dashboard
+    tmux -f "$CONF" select-pane -t "$PROMPT"   # the prompt, and it stays the prompt
     exec tmux -f "$CONF" attach-session -t "$SESSION"
 fi
 

@@ -110,7 +110,8 @@ def _repos_conf(overlay: str | Path) -> str:
 
 
 def emerge_argv(lock: dict, *, root: str | Path = "/", pretend: bool = False,
-                atoms: list[str] | None = None, binhost: bool = False) -> list[str]:
+                atoms: list[str] | None = None, binhost: bool = False,
+                deep: bool = True, oneshot: bool = False) -> list[str]:
     """The emerge invocation for this lockfile.
 
     `--deep --newuse` is what makes a USE-flag change in the lock actually take
@@ -120,13 +121,30 @@ def emerge_argv(lock: dict, *, root: str | Path = "/", pretend: bool = False,
     already compiled (see `binhost_env`). It changes only where object code
     comes from, never what gets built: portage still resolves the graph from the
     rendered lockfile, and rejects any binpkg whose USE flags disagree with it.
+
+    `deep=False, oneshot=True` is the minimizer's shape. It rebuilds ONE atom, once
+    per lever, dozens of times — and `--deep` re-resolves the entire dependency graph
+    on every one of those, which is pure waste when only that atom's USE changed.
+    `--changed-use` still catches the flag flip, which is the only thing that moved.
+    `--oneshot` keeps the atom out of @world, so a minimization run does not rewrite
+    the world file dozens of times as a side effect of measuring.
     """
-    argv = ["emerge", "--verbose", "--deep", "--newuse", "--changed-use"]
+    argv = ["emerge", "--verbose", "--newuse", "--changed-use"]
+    if deep:
+        argv.insert(2, "--deep")
+    if oneshot:
+        argv.append("--oneshot")
     if binhost:
         # --usepkg alone would accept only LOCAL binpkgs; --getbinpkg is what
         # reaches the remote host. Both, so a peer's cache and this machine's
         # own `buildpkg` output are equally usable.
-        argv += ["--getbinpkg", "--usepkg"]
+        #
+        # --binpkg-respect-use=y is the load-bearing one: it makes portage REJECT a
+        # prebuilt package whose USE flags disagree with what the lockfile asked for,
+        # and build from source instead. Without it, reusing a peer's binary silently
+        # discards the feature decisions that are this project's entire point — a
+        # peer's vim with +X would install over an intent that says no X11.
+        argv += ["--getbinpkg", "--usepkg", "--binpkg-respect-use=y"]
     if str(root) != "/":
         argv.append(f"--root={root}")
     if pretend:

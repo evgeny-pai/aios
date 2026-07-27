@@ -170,7 +170,57 @@ spec but cannot promote a generation cannot brick the machine.
 - [ ] local-weights provider on-device
 - [ ] `x86_64` port (mechanical once `CHOST`/profile derivation is exercised twice)
 
-## 7. Open questions
+## 7. Per-host binary diversity: measured, and declined for now
+
+The question is whether each node should get a *slightly different* binary of the
+same package — randomised layout, so one exploit does not work everywhere. Measured
+on this machine's actual toolchain (gcc 15.3.0, GNU ld 2.46.0, aarch64/musl):
+
+| Lever | State here | What it actually buys |
+|---|---|---|
+| PIE / ASLR | **already on** — `-fPIE [enabled]`, `pie` in gcc's specs | Randomises addresses per *execution*, which is strictly stronger than per-host-but-fixed layout. This is the defence that matters, and it is free. |
+| `-frandom-seed=<per-host>` | accepted by gcc | Changes internal symbol/hash naming. Object files differ; code layout does not meaningfully move. It exists for *reproducible* builds, not diversity — weak as a security measure. |
+| Section shuffling | **not available** — GNU ld 2.46 has no `--shuffle-sections` | Real layout diversity needs LLVM's `lld --shuffle-sections=<seed>`, so it would mean `sys-devel/lld` and a linker switch. |
+| `-ffunction-sections -fdata-sections` + custom link order | possible | Genuine reordering, but with GNU ld it means generating a linker script per host. |
+
+The reason it is declined is not difficulty, it is that **diversity and reuse are
+the same axis pointed in opposite directions**:
+
+- A per-host-unique binary cannot be shared, so the binhost (§ the network) stops
+  saving anything — every node compiles everything, forever.
+- It breaks the guarantee the lockfile exists to make. "Same spec plus same digest
+  produces the same system" is what makes a build reviewable and a failure
+  debuggable. Randomising the output makes two nodes with an identical lock
+  *provably different*, and there is then no artifact that says what a node is.
+
+So the honest position: ASLR already covers the threat, and paying for static
+diversity with the lockfile's reproducibility is a bad trade at this stage. If it is
+ever wanted, the shape is a spec field — `system.diversity = "seed"` — because it is
+a property of one machine, and a node that sets it must also stop consuming binary
+packages, since by construction none of them can fit it.
+
+## 8. Making the rebuild loop cheap
+
+`forge minimize` rebuilds one package once per lever. Everything that makes that
+cheaper is load-bearing, not an optimisation:
+
+- **`--oneshot`, no `--deep`** for the minimizer's single-atom rebuilds. `--deep`
+  re-resolved the whole dependency graph on every lever; `--changed-use` alone
+  catches the one flag that moved, and `--oneshot` stops a measurement run from
+  rewriting `@world` dozens of times as a side effect.
+- **`buildpkg`, spec-owned.** Every build leaves a binary package behind, which is
+  both the peer cache and the local one. A model cannot turn this off.
+- **A compiler cache** (`dev-util/ccache`), which is what an intent now asks for:
+  a dozen near-identical compiles of one package is exactly its best case.
+- **Binary packages from a peer**, with `--binpkg-respect-use=y` so a prebuilt
+  package whose flags disagree with the lock is *rejected and rebuilt* rather than
+  installed. Reuse may save time; it may not change what you get.
+- Not yet done, in rough order of payoff: `PORTAGE_TMPDIR` on tmpfs (this pod's
+  `/dev/shm` is 64 MB, so it needs a sized memory-backed volume and a memory limit
+  raised to match — an OOM mid-build is worse than a slow build), and `distcc`
+  across the network, which is the obvious use of more than one node.
+
+## 9. Open questions
 
 - **Kernel minimization objective.** Size is the obvious metric, but attack
   surface (enabled syscalls, loadable modules) is the interesting one and needs
