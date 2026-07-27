@@ -40,6 +40,61 @@ spec:
     requests:
       storage: 4Gi
 ---
+# What the machine BUILDS WITH and what it HAS BUILT, on storage that outlives the
+# container.
+#
+# These three were ephemeral until 2026-07-27, and the cost of that was measured, not
+# guessed: 793 MB of state — a 32,695-ebuild tree fetched by emerge-webrsync, the
+# binary package cache, and the distfiles behind it — all sat in the container's
+# writable layer, where a colima restart or an OOM kill erases them. The repo focus
+# carried a "do NOT delete the pod" warning for weeks, which is a sticky note doing a
+# volume's job. The Service comment below already claimed this node "holds the ebuild
+# tree, the binary package cache, and the source releases its peers update from";
+# nothing backed that claim with storage.
+#
+# NOT on this list, deliberately: /var/db/pkg. The installed database describes files
+# under /usr that live in the ephemeral layer, so persisting the database alone would
+# survive a recreate that removed the binaries it describes — the machine would insist
+# tmux is installed with no /usr/bin/tmux. Losing the database is loud and recoverable;
+# a database that lies is neither. It comes fresh from the image, and the packages come
+# back from binpkgs below, which is the project's own thesis applied to itself: the
+# machine reconstitutes from a lockfile plus its own cache.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aios-portage
+  namespace: aios
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 4Gi # 704 MB of tree today; headroom for it to grow with sync
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aios-binpkgs
+  namespace: aios
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # The seed the rest of the network pulls from, and what makes `forge minimize`
+      # affordable — it writes one build per lever, so this grows fastest of the three.
+      # 549 MB for 295 packages today.
+      storage: 16Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aios-distfiles
+  namespace: aios
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 4Gi
+---
 # The first node to sync becomes the seed of the network: it holds the ebuild tree,
 # the binary package cache, and the source releases its peers update from. Every node
 # after it is cheap, which is what makes `forge minimize` — one rebuild per lever —
@@ -103,15 +158,28 @@ spec:
       volumeMounts:
         - name: state
           mountPath: /aios/.aios
+        - name: portage
+          mountPath: /var/db/repos/gentoo
+        - name: binpkgs
+          mountPath: /var/cache/binpkgs
+        - name: distfiles
+          mountPath: /var/cache/distfiles
       resources:
-        # A stage3 with a toolchain wants room to compile; 4Gi is enough for a
-        # single package at -j2 and leaves headroom on a 12Gi colima VM.
+        # MAKEOPTS is -j8 (spec: system.makeopts), so a cpu limit of 3 meant eight
+        # compile jobs fighting over a three-core quota on a ten-core machine — the
+        # build was slow for a reason that had nothing to do with the compiler. The
+        # limit is 8 to match -j8; keep the two in step if either changes.
+        #
+        # The limit may exceed what the colima VM currently has. That is deliberate:
+        # a limit above node capacity is simply never reached, so the pod uses whatever
+        # the VM has today and the full eight the day the VM is widened, with no
+        # manifest edit in between. `requests` is what must stay schedulable.
         requests:
           cpu: "500m"
           memory: 1Gi
         limits:
-          cpu: "3"
-          memory: 4Gi
+          cpu: "8"
+          memory: 8Gi
       securityContext:
         runAsUser: 0
         runAsGroup: 0
@@ -125,3 +193,12 @@ spec:
     - name: state
       persistentVolumeClaim:
         claimName: aios-state
+    - name: portage
+      persistentVolumeClaim:
+        claimName: aios-portage
+    - name: binpkgs
+      persistentVolumeClaim:
+        claimName: aios-binpkgs
+    - name: distfiles
+      persistentVolumeClaim:
+        claimName: aios-distfiles
