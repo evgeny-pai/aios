@@ -73,6 +73,31 @@ print(short + "... " + str(len(l["packages"])) + " packages")
 ')
 [ -n "$lock" ] && step ok "lockfile" "$lock" || step warn "lockfile" "absent or digest mismatch"
 
+# /etc/portage is DERIVED, so derive it — every boot, from the lockfile.
+#
+# It is not on a volume and it must not be: persisting it would let it drift from
+# the lockfile that is supposed to define it, which is the one thing this project
+# cannot allow. But nothing was regenerating it either, and the gap was expensive.
+# A recreated pod came up with the stock catalyst make.conf, which meant MAKEOPTS
+# was UNSET — every package compiled on one core, on a machine given eight — and
+# FEATURES lost `buildpkg`, so builds stopped feeding the binary package cache the
+# rest of the network pulls from. Both failures are silent: emerge is perfectly
+# happy to be slow and to produce nothing reusable.
+#
+# Rendering here also means the lockfile is the only way to change build policy.
+# Hand-editing /etc/portage now survives exactly until the next boot, which is the
+# correct lifetime for an edit that bypassed the spec.
+render=$(py '
+from forge import lock, portage
+l = lock.load("aios.lock.json")
+print(len(portage.render(l, "/", lock_path="aios.lock.json", overlay="/aios/overlay")))
+')
+if [ -n "$render" ]; then
+    step ok "portage config" "$render files from the lockfile"
+else
+    step warn "portage config" "NOT rendered — MAKEOPTS/FEATURES/USE are stage3 defaults"
+fi
+
 if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
     step ok "ai provider" "${AIOS_MODEL:-claude-haiku-4-5-20251001}"
 else
