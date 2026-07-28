@@ -9,6 +9,7 @@ results with it.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +17,14 @@ from pathlib import Path
 from unittest import mock
 
 from aios import ci as ci_mod
+
+#: Building a real repository needs a real git, and the IMAGE has none — git arrives at
+#: boot, restored from the binpkg cache, long after the Dockerfile's release gate has
+#: run. A skip says "not covered here"; a failure would say the CI runner is broken, and
+#: the gate would go red on every image build. See skills/host-dependent-assertions.
+needs_git = unittest.skipUnless(
+    shutil.which("git"), "needs git, which the image does not carry until boot restores it"
+)
 
 
 def bare_repo(root: Path, name: str) -> Path:
@@ -55,6 +64,7 @@ class TestRunOne(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp())
 
+    @needs_git
     def test_an_absent_tool_is_skipped_with_the_reason_and_the_command(self):
         """conductorai needs node; this node has none. That is not a failure."""
         bare = bare_repo(self.root, "conductorai")
@@ -69,6 +79,7 @@ class TestRunOne(unittest.TestCase):
         self.assertEqual(got["status"], "skipped")
         self.assertIn("no gate", got["reason"])
 
+    @needs_git
     def test_a_passing_gate_records_the_commit_it_tested(self):
         bare = bare_repo(self.root, "aios")
         with mock.patch.dict(ci_mod.GATES, {"aios": ("true",)}, clear=False):
@@ -77,6 +88,7 @@ class TestRunOne(unittest.TestCase):
         self.assertRegex(got["commit"], r"^[0-9a-f]{7,}$")
         self.assertEqual(got["exit_code"], 0)
 
+    @needs_git
     def test_a_failing_gate_is_reported_not_raised(self):
         bare = bare_repo(self.root, "aios")
         with mock.patch.dict(ci_mod.GATES, {"aios": ("false",)}, clear=False):
@@ -84,6 +96,7 @@ class TestRunOne(unittest.TestCase):
         self.assertEqual(got["status"], "fail")
         self.assertNotEqual(got["exit_code"], 0)
 
+    @needs_git
     def test_a_hanging_gate_becomes_an_error_instead_of_hanging_the_report(self):
         bare = bare_repo(self.root, "aios")
         with mock.patch.dict(ci_mod.GATES, {"aios": ("sleep", "30")}, clear=False):
@@ -97,6 +110,7 @@ class TestReport(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.report = Path(tempfile.mkdtemp()) / "ci" / "latest.json"
 
+    @needs_git
     def test_a_report_of_only_skips_is_not_green(self):
         """The trap this guards: nothing ran, nothing failed, so it looked fine."""
         bare_repo(self.root, "conductorai")
@@ -106,6 +120,7 @@ class TestReport(unittest.TestCase):
         self.assertEqual(summary["passed"], 0)
         self.assertEqual(summary["skipped"], 1)
 
+    @needs_git
     def test_one_failure_fails_the_whole_report(self):
         bare_repo(self.root, "aios")
         with mock.patch.dict(ci_mod.GATES, {"aios": ("false",)}, clear=False):
@@ -113,6 +128,7 @@ class TestReport(unittest.TestCase):
         self.assertFalse(summary["ok"])
         self.assertEqual(summary["failed"], 1)
 
+    @needs_git
     def test_the_report_is_written_where_peers_can_fetch_it(self):
         bare_repo(self.root, "aios")
         with mock.patch.dict(ci_mod.GATES, {"aios": ("true",)}, clear=False):
