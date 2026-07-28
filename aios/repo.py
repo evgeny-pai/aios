@@ -23,6 +23,7 @@ may add a dependency to a machine whose only interpreter is portage's own python
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -221,6 +222,44 @@ def serve(port: int = SERVE_PORT) -> None:
         httpd.serve_forever()
 
 
+#: `CPV: cat/name-version` in the binary package index. The version is stripped to get
+#: back to an atom, and the boundary is a hyphen followed by a digit — `docbook-xml-dtd`
+#: and `libjpeg-turbo` both contain hyphens, so splitting on the last one is wrong.
+_CPV_VERSION = re.compile(r"-[0-9][^-]*(?:-r[0-9]+)?$")
+
+
+def cached_atoms(index: Path | None = None) -> list[str]:
+    """The atoms this node already has a binary package for.
+
+    Exists because "restore what was installed" cannot be spelled `emerge @aios`. That
+    set names everything an intent asked for, and `--usepkgonly` ABORTS THE WHOLE RUN on
+    the first member with no binary package — `there are no binary packages to satisfy
+    "dev-vcs/git"` — before installing any of the ones that were available. `--keep-going`
+    does not help: the failure is in dependency resolution, not in a build. So a boot-time
+    restore has to ask for the intersection, and this is that intersection.
+
+    Read from the index rather than the directory tree: with binpkg-multi-instance the
+    files live at <cat>/<name>/<name>-<ver>-<build>.gpkg.tar, and a glob written for the
+    old two-level layout silently matches nothing — which reads as "no cache" rather than
+    as a bug.
+    """
+    path = Path(index) if index is not None else BINPKGS / "Packages"
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    atoms = set()
+    for line in raw.splitlines():
+        if not line.startswith("CPV:"):
+            continue
+        cpv = line.split(":", 1)[1].strip()
+        category, _, rest = cpv.partition("/")
+        if not category or not rest:
+            continue
+        atoms.add(f"{category}/{_CPV_VERSION.sub('', rest)}")
+    return sorted(atoms)
+
+
 def client_config(host: str, port: int = SERVE_PORT) -> str:
     """The portage config a peer needs to consume another node's repo.
 
@@ -251,9 +290,16 @@ def main(argv: list[str] | None = None) -> int:
             serve(_port())
         elif command == "client":
             print(client_config(argv[1] if len(argv) > 1 else "aios-repo"))
+        elif command == "cached-atoms":
+            # Space-separated on one line: the caller is a boot script assembling an
+            # emerge command line, not a human reading a list.
+            print(" ".join(cached_atoms()))
         else:
             print(__doc__)
-            print("usage: python3 -m aios.repo {sync [--force]|serve|client [host]}")
+            print(
+                "usage: python3 -m aios.repo "
+                "{sync [--force]|serve|client [host]|cached-atoms}"
+            )
             return 2
     except RepoError as exc:
         print(f"aios.repo: {exc}", file=sys.stderr)

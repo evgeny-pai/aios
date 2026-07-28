@@ -13,6 +13,7 @@ absent keys.
 from __future__ import annotations
 
 import re
+import sys
 
 from . import lock as lock_mod
 from . import portage as portage_mod
@@ -234,11 +235,35 @@ def validate(payload: dict, spec: spec_mod.Spec) -> dict:
 
 
 def lower(spec: spec_mod.Spec, provider: Provider) -> dict:
-    """Run the lowering pass and return a stamped lockfile."""
-    payload = provider.complete_json(
-        system=SYSTEM_PROMPT, prompt=build_prompt(spec), schema=SCHEMA
-    )
-    validate(payload, spec)
+    """Run the lowering pass and return a stamped lockfile.
+
+    A backend can return JSON that satisfies the schema and still is not a lockfile.
+    The observed case, from a 14B local model: USE flags written as `"-X11"` instead of
+    `{"flag": "X11", "enabled": false}` — the sign folded into the name, which the
+    schema cannot forbid because it only knows the field is a string. `validate` catches
+    it, but by then the provider has already returned successfully, so a provider-level
+    fallback never sees a failure at all.
+
+    So the retry belongs here: if the provider is a chain, a rejected payload retires
+    the link that produced it and the next one is asked. This keeps "the local model
+    first" honest — a local model that cannot hold the output contract costs one wasted
+    call rather than the whole lowering.
+    """
+    prompt = build_prompt(spec)
+    while True:
+        payload = provider.complete_json(system=SYSTEM_PROMPT, prompt=prompt, schema=SCHEMA)
+        try:
+            validate(payload, spec)
+        except LoweringError as exc:
+            retire = getattr(provider, "retire_answering_link", None)
+            if retire is not None and retire():
+                print(
+                    f"forge: {exc}\nforge: retrying the lowering with the next backend",
+                    file=sys.stderr,
+                )
+                continue
+            raise
+        break
     return lock_mod.build(
         spec, payload, {"provider": provider.name, "model": provider.model}
     )

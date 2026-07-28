@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,7 @@ from forge import probe as probe_mod
 from forge import provider as provider_mod
 from forge import spec as spec_mod
 from forge.cli import main
+from forge.provider import fallback as fallback_mod
 
 #: The repo this suite is testing, found from the file rather than from the cwd —
 #: the shipped spec and the shipped probes are part of what is under test.
@@ -530,9 +532,18 @@ class TestCLI(unittest.TestCase):
         self.run_forge("lower")
         # No network in this suite. A refused connection is also the honest state of
         # every machine that has no share daemon, which is most of them.
-        with mock.patch("aios.mesh._urlopen", side_effect=OSError("no share daemon")):
+        #
+        # emerge is forced absent rather than assumed absent. This suite also runs
+        # INSIDE the Gentoo target image (`aios.update gate`, Dockerfile step 20),
+        # where emerge is on PATH — there the no-emerge branch never ran, a real
+        # `emerge --pretend` decided the exit code, and stdout was empty, so the
+        # assertion below described the dev laptop rather than the code. Only
+        # forge.cli looks a binary up in this path, so this cannot mask the mesh
+        # caveat asserted underneath. See skills/host-dependent-assertions.
+        with mock.patch("aios.mesh._urlopen", side_effect=OSError("no share daemon")), \
+             mock.patch("forge.cli.shutil.which", return_value=None):
             code = self.run_forge("build", "--distcc")
-        self.assertEqual(code, 1, "there is no emerge on a dev host")
+        self.assertEqual(code, 1, "a host without emerge reports instead of building")
         self.assertIn("emerge is not on PATH", self.out)
         # The caveat travels with the flag: an empty host list is a local build, and
         # the note names which of the several possible reasons made it empty — here,
@@ -895,7 +906,15 @@ class TestFeatureChecksAreWholeWord(unittest.TestCase):
         return checks[0]
 
     def verdict(self, probe: str, features: str, *binaries: str) -> bool:
-        """Run that one check against an `emerge --info` this test wrote."""
+        """Run that one check against an `emerge --info` this test wrote.
+
+        A binary named in `binaries` is stubbed present; one that is NOT named must
+        be genuinely ABSENT, so any directory holding a real copy is dropped from
+        PATH rather than merely shadowed. Prepending alone made the absent case a
+        statement about the machine: it held on a dev laptop and broke inside a node
+        that had actually installed the package — which is precisely where the
+        release gate runs. See skills/host-dependent-assertions.
+        """
         check = self.config_check(probe)
         with tempfile.TemporaryDirectory() as bindir:
             for name, body in (("emerge", f"printf 'FEATURES=\"{features}\"\\n'"),
@@ -903,10 +922,25 @@ class TestFeatureChecksAreWholeWord(unittest.TestCase):
                 stub = Path(bindir) / name
                 stub.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
                 stub.chmod(0o755)
+            path = [bindir, *os.environ.get("PATH", "").split(os.pathsep)]
+            if probe not in binaries:
+                # Absence has to be constructed, not inherited. Dropping every
+                # directory that holds a real copy would also drop grep — the check
+                # would then fail for the wrong reason, which is the vacuous-check
+                # trap the probe's own comments warn about. So re-provide the
+                # utilities a config check uses, by symlink, from the original PATH.
+                shim = Path(bindir) / "_shim"
+                shim.mkdir()
+                for tool in ("bash", "sh", "grep", "sed", "awk", "cat", "tr", "head",
+                             "wc", "env", "test", "true", "false", "gcc"):
+                    if tool == probe:
+                        continue
+                    found = shutil.which(tool)
+                    if found:
+                        (shim / tool).symlink_to(found)
+                path = [bindir, str(shim)]
             one = probe_mod.Probe(name=probe, description="", atoms=(), checks=(check,))
-            with mock.patch.dict(
-                os.environ, {"PATH": f"{bindir}:{os.environ.get('PATH', '')}"}
-            ):
+            with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(path)}):
                 return probe_mod.run(one).passed
 
     def test_ccache_enabled_passes_and_disabled_fails(self):
@@ -931,6 +965,109 @@ class TestFeatureChecksAreWholeWord(unittest.TestCase):
         features = spec_mod.load(REPO / "aios.toml").system.features.split()
         for feature in ("ccache", "distcc"):
             self.assertIn(feature, features)
+
+
+class TestFallbackChain(unittest.TestCase):
+    """Ask the local model first; keep working when it cannot deliver."""
+
+    class Stub:
+        def __init__(self, name: str, payload: dict | None = None, error: str = "") -> None:
+            self.name = name
+            self.model = f"{name}-model"
+            self.payload = payload
+            self.error = error
+            self.calls = 0
+
+        def describe(self) -> str:
+            return f"{self.name}:{self.model}"
+
+        def complete_json(self, *, system, prompt, schema):
+            self.calls += 1
+            if self.error:
+                raise provider_mod.ProviderError(self.error)
+            return dict(self.payload or {})
+
+    def chain(self, *links):
+        return fallback_mod.FallbackProvider(list(links))
+
+    def test_a_working_local_link_is_the_only_one_asked(self):
+        local, cloud = self.Stub("ollama", {"by": "local"}), self.Stub("anthropic", {"by": "cloud"})
+        got = self.chain(local, cloud).complete_json(system="s", prompt="p", schema={})
+        self.assertEqual(got["by"], "local")
+        self.assertEqual(cloud.calls, 0, "the hosted backend must not be paid when local answers")
+
+    def test_a_failing_local_link_hands_over(self):
+        local, cloud = self.Stub("ollama", error="daemon not running"), self.Stub("anthropic", {"by": "cloud"})
+        chain = self.chain(local, cloud)
+        self.assertEqual(chain.complete_json(system="s", prompt="p", schema={})["by"], "cloud")
+        self.assertEqual((local.calls, cloud.calls), (1, 1))
+        self.assertIs(chain.answered, cloud)
+
+    def test_every_link_failing_reports_all_of_them(self):
+        chain = self.chain(self.Stub("ollama", error="down"), self.Stub("anthropic", error="HTTP 401"))
+        with self.assertRaises(provider_mod.ProviderError) as caught:
+            chain.complete_json(system="s", prompt="p", schema={})
+        # Both reasons, because "the model failed" is not an actionable message when
+        # one link was unreachable and the other rejected the credentials.
+        self.assertIn("down", str(caught.exception))
+        self.assertIn("HTTP 401", str(caught.exception))
+
+    def test_retiring_the_answering_link_advances_then_runs_out(self):
+        local, cloud = self.Stub("ollama", {"n": 1}), self.Stub("anthropic", {"n": 2})
+        chain = self.chain(local, cloud)
+        chain.complete_json(system="s", prompt="p", schema={})
+        self.assertTrue(chain.retire_answering_link(), "the hosted link is still there")
+        self.assertEqual(chain.chain, [cloud])
+        chain.complete_json(system="s", prompt="p", schema={})
+        self.assertFalse(chain.retire_answering_link(), "nothing left to fall back to")
+
+    def test_the_chain_cannot_contain_itself(self):
+        """AIOS_PROVIDER=fallback must not make every link resolve to the chain again."""
+        with mock.patch.dict(
+            os.environ, {"AIOS_FALLBACK_CHAIN": "fallback,echo", "AIOS_PROVIDER": "fallback"}
+        ):
+            built = fallback_mod.build("echo", "", effort="medium")
+        self.assertEqual([link.name for link in built.chain], ["echo"])
+
+    def test_a_rejected_payload_is_retried_on_the_next_backend(self):
+        """The failure mode measured on a 14B local model, in the shape lower() sees.
+
+        The provider returned successfully — schema-valid JSON — and the pipeline then
+        refused it. Nothing raises at provider level, so only lower() can advance the
+        chain, and if it does not the whole lowering dies on a bad local answer.
+        """
+        spec = spec_mod.load(REPO / "aios.toml")
+        local, cloud = self.Stub("ollama", {"bad": True}), self.Stub("anthropic", {"good": True})
+        chain = self.chain(local, cloud)
+        seen = []
+
+        def fake_validate(payload, _spec):
+            seen.append(payload)
+            if payload.get("bad"):
+                raise lower_mod.LoweringError("use[0].flag = '-X11' is not a USE flag name")
+
+        with mock.patch.object(lower_mod, "validate", fake_validate), mock.patch.object(
+            lower_mod.lock_mod, "build", lambda s, p, g: {"payload": p, "generated_by": g}
+        ):
+            out = lower_mod.lower(spec, chain)
+        self.assertEqual(out["payload"], {"good": True})
+        self.assertEqual(out["generated_by"]["model"], "anthropic-model",
+                         "the lock must be attributed to the backend that actually produced it")
+        self.assertEqual(len(seen), 2, "both payloads were validated, not just the first")
+
+    def test_a_rejected_payload_still_raises_when_there_is_no_chain(self):
+        """A single backend must not silently loop — the retry needs a link to retire."""
+        spec = spec_mod.load(REPO / "aios.toml")
+
+        def always_bad(payload, _spec):
+            raise lower_mod.LoweringError("nope")
+
+        with mock.patch.object(lower_mod, "validate", always_bad):
+            with self.assertRaises(lower_mod.LoweringError):
+                lower_mod.lower(spec, self.Stub("anthropic", {"x": 1}))
+
+    def test_the_shipped_spec_asks_for_the_chain(self):
+        self.assertEqual(spec_mod.load(REPO / "aios.toml").agent.provider, "fallback")
 
 
 if __name__ == "__main__":

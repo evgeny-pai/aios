@@ -95,6 +95,41 @@ spec:
     requests:
       storage: 4Gi
 ---
+# The compiler cache. This was ephemeral until 2026-07-28 and that quietly cost the
+# whole point of FEATURES="ccache": make.conf sets CCACHE_DIR=/var/cache/ccache and
+# CCACHE_SIZE=20G, so the machine was told to keep 20 GB of compile results in a
+# directory that a pod recreate resets to empty. `forge minimize` rebuilds a package
+# once per lever and is the workload ccache exists to make affordable — with an
+# ephemeral cache every lever paid full compile price again after any restart.
+#
+# Sized to CCACHE_SIZE rather than guessed; keep the two in step if either changes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aios-ccache
+  namespace: aios
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+# What this node SERVES: aios.repo.serve() builds /srv/aios (symlinks to the tree and
+# the binpkg cache) and aios.update.publish writes source releases plus latest.json
+# under AIOS_SRC_DIR=/srv/aios/src. Peers `check` and `apply` against exactly that
+# manifest, so an ephemeral /srv/aios means every pod recreate silently retracts every
+# release this node had published and any git repository hosted beside them.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aios-srv
+  namespace: aios
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
 # The first node to sync becomes the seed of the network: it holds the ebuild tree,
 # the binary package cache, and the source releases its peers update from. Every node
 # after it is cheap, which is what makes `forge minimize` — one rebuild per lever —
@@ -115,6 +150,14 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+    # distccd. This node accepts compile jobs as well as sending them, so the port a
+    # distcc client dials is part of the node's published surface, exactly like the
+    # tree and the binpkgs above. In-cluster reachability only: the cluster
+    # deliberately binds no host ports (see kind-cluster.yaml), so a client outside
+    # the cluster reaches it through `kubectl port-forward`, not through the node.
+    - name: distcc
+      port: 3632
+      targetPort: 3632
 ---
 apiVersion: v1
 kind: Pod
@@ -154,6 +197,21 @@ spec:
         # it. A URL is not a credential, so it belongs here; the token does not.
         - name: AIOS_MESH_URL
           value: http://host.docker.internal:4748
+        # Where the LOCAL model lives, for the spec's `fallback` provider chain.
+        #
+        # Not an AIOS_PROVIDER/AIOS_MODEL override — those are still deliberately absent
+        # because they make the spec unchangeable from inside the machine. These two are
+        # topology, the same category as AIOS_MESH_URL above: the spec says "prefer a
+        # local model", and this says which daemon that is. Ollama runs on the HOST
+        # (it needs the GPU), so host.docker.internal is the route, exactly as for the
+        # share daemon.
+        #
+        # AIOS_OLLAMA_MODEL rather than AIOS_MODEL because a chain spans backends and
+        # `qwen3:14b` means nothing to the hosted API.
+        - name: OLLAMA_HOST
+          value: http://host.docker.internal:11434
+        - name: AIOS_OLLAMA_MODEL
+          value: qwen3:14b
       envFrom:
         # Both optional: the pod must boot when no credentials have been created
         # yet, and must never be blocked from starting by their absence. A machine
@@ -179,6 +237,10 @@ spec:
           mountPath: /var/cache/binpkgs
         - name: distfiles
           mountPath: /var/cache/distfiles
+        - name: ccache
+          mountPath: /var/cache/ccache
+        - name: srv
+          mountPath: /srv/aios
       resources:
         # MAKEOPTS is -j8 (spec: system.makeopts), so a cpu limit of 3 meant eight
         # compile jobs fighting over a three-core quota on a ten-core machine — the
@@ -217,3 +279,9 @@ spec:
     - name: distfiles
       persistentVolumeClaim:
         claimName: aios-distfiles
+    - name: ccache
+      persistentVolumeClaim:
+        claimName: aios-ccache
+    - name: srv
+      persistentVolumeClaim:
+        claimName: aios-srv

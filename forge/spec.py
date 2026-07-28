@@ -13,7 +13,10 @@ from pathlib import Path
 ARCHES = ("aarch64", "x86_64")
 LIBCS = ("musl", "glibc")
 INITS = ("dinit", "s6", "runit", "openrc")
-PROVIDERS = ("anthropic", "openai", "ollama", "echo")
+#: `fallback` is a chain rather than a backend — it asks the local model first and the
+#: hosted one when that fails. It belongs here because the spec is where a machine
+#: states its model policy, and "prefer local, keep working without it" is a policy.
+PROVIDERS = ("fallback", "anthropic", "openai", "ollama", "echo")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 

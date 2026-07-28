@@ -79,16 +79,33 @@ def parse_json_text(text: str, *, who: str) -> dict:
     return value
 
 
-def load(provider: str, model: str = "", *, effort: str = "medium") -> Provider:
+def load(
+    provider: str, model: str = "", *, effort: str = "medium", respect_env: bool = True
+) -> Provider:
     """Instantiate a provider by name. Env vars win over the spec.
 
     AIOS_PROVIDER, AIOS_MODEL, AIOS_EFFORT override their spec counterparts so a
     build host and an on-target agent can share one committed spec.
+
+    `respect_env=False` is for building the links of a fallback chain. Without it,
+    AIOS_PROVIDER=fallback would win again for every link and the chain would resolve
+    to itself forever — the env override is right for the caller's choice of backend
+    and wrong for a backend the chain has already chosen.
     """
-    provider = os.environ.get("AIOS_PROVIDER", provider or "anthropic")
-    model = os.environ.get("AIOS_MODEL", model)
+    if respect_env:
+        provider = os.environ.get("AIOS_PROVIDER", provider or "anthropic")
+        model = os.environ.get("AIOS_MODEL", model)
+    else:
+        provider = provider or "anthropic"
     effort = os.environ.get("AIOS_EFFORT", effort)
 
+    if provider == "fallback":
+        from .fallback import build
+
+        # The spec's provider/model describe ONE backend; the chain needs to know which
+        # link they belong to, so they are passed through rather than applied here.
+        spec_provider = os.environ.get("AIOS_SPEC_PROVIDER", "")
+        return build(spec_provider, model, effort=effort)
     if provider == "anthropic":
         from .anthropic import AnthropicProvider
 
@@ -105,4 +122,6 @@ def load(provider: str, model: str = "", *, effort: str = "medium") -> Provider:
         from .echo import EchoProvider
 
         return EchoProvider(model=model)
-    raise ProviderError(f"unknown provider {provider!r} (anthropic, openai, ollama, echo)")
+    raise ProviderError(
+        f"unknown provider {provider!r} (anthropic, openai, ollama, echo, fallback)"
+    )

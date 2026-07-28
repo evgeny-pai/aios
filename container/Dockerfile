@@ -40,6 +40,16 @@ COPY skills/ /aios/skills/
 COPY README.md DESIGN.md MANUAL.md /aios/
 
 # Boot and login paths.
+# The container/ sources also land INSIDE /aios, not only at their install paths.
+#
+# aios.update.PAYLOAD lists `container`, because an update has to be able to deliver
+# the boot path (/sbin/aios-init), the login path and the tmux layout — INSTALL copies
+# them out of the payload after a successful swap. Copying these files only to their
+# destinations left /aios/container absent, so `aios.update publish` failed outright
+# with "cannot publish, missing from /aios: container" and this node could not serve
+# its own code to the mesh at all. A node that can take updates but never publish one
+# is only half of the A/B story in DESIGN.md §5.
+COPY container/ /aios/container/
 COPY container/aios-init /sbin/aios-init
 COPY container/aios-login /sbin/aios-login
 COPY container/manual /usr/local/bin/manual

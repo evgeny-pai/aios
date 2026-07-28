@@ -134,6 +134,62 @@ def node_id(root: Path | None = None) -> str:
     return minted
 
 
+NAME_FILE = "node-name"
+
+
+def node_name(root: Path | None = None) -> str:
+    """The name this machine picks for itself, for a human to read.
+
+    Distinct from `node_id()`, which is the stable identifier the mesh matches on and
+    must never be pretty at the cost of being unique. This is the other half: three
+    pods built from one spec are all called `aios`, all report the same spec name, and
+    are told apart today only by a hex node id — which is exactly the kind of thing a
+    person reads twice and still gets wrong. A foundry word is read once.
+
+    Minted from the same word list as the operator handle and persisted beside it on
+    the state volume, so the machine keeps the name across recreates. It chooses its
+    own rather than taking one from the manifest, because a name in the manifest is
+    the same name on every node that applies that manifest.
+    """
+    path = Path(root or os.environ.get("AIOS_ROOT", "/aios")) / STATE / NAME_FILE
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+
+    minted = _mint()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".new")
+        tmp.write_text(minted + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass  # an unwritable volume costs persistence, not identity
+    return minted
+
+
+def hostname(root: Path | None = None, generation: int | None = None) -> str:
+    """`aios-<generation>-<name>` — what this incarnation of this machine is called.
+
+    The generation is in the name on purpose. Two of the three facts that make a node
+    itself are already stable (the id and the name); the third is which boot you are
+    looking at, and that is the one that has actually caused confusion — a node
+    reported running code it was not running, and a pod recreate that reverted the
+    ephemeral layer was indistinguishable from one that did not. A prompt that reads
+    `aios-9-anvil-3f` cannot be mistaken for `aios-8-anvil-3f`.
+
+    Composed rather than stored, so it cannot go stale against the counter.
+    """
+    from . import generation as generation_mod
+
+    # generation.current() takes its root from AIOS_ROOT rather than an argument, so
+    # callers passing an explicit root (the tests) must pass the generation too.
+    gen = generation_mod.current() if generation is None else generation
+    return f"aios-{gen}-{node_name(root)}"
+
+
 def node_label(root: Path | None = None) -> str:
     """How this node should introduce itself: what it is, which incarnation, and who.
 

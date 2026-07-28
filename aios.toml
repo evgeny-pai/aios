@@ -27,7 +27,15 @@ makeopts = "-j8"
 features = "buildpkg parallel-fetch ccache distcc -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox"
 
 [agent]
-provider = "anthropic"         # anthropic | openai | ollama | echo
+# `fallback` asks the local model first and the hosted one only if that fails —
+# unreachable daemon, timeout, or an answer the lowering validator rejects. The chain
+# is AIOS_FALLBACK_CHAIN (default "ollama,anthropic") and each link takes its model
+# from AIOS_<LINK>_MODEL, because `qwen3:14b` and `claude-opus-5` cannot share one
+# AIOS_MODEL. Measured on qwen3:14b: it returns schema-valid JSON but folds the sign
+# into USE flag names ("-X11"), which the validator refuses, so in practice the hosted
+# model still produces the lock — the local attempt costs one call and keeps the spec
+# on the premises when a bigger local model can hold the contract.
+provider = "fallback"          # fallback | anthropic | openai | ollama | echo
 model    = ""                  # empty = provider default
 effort   = "medium"            # low | medium | high | xhigh | max
 

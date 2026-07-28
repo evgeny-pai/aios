@@ -98,6 +98,94 @@ else
     step warn "portage config" "NOT rendered — MAKEOPTS/FEATURES/USE are stage3 defaults"
 fi
 
+# Reinstall what this machine had built, from what this machine built it into.
+#
+# /usr lives in the image layer and /var/db/pkg is deliberately not a volume (see the
+# manifest: a persisted package database would outlive the binaries it describes and
+# insist tmux is installed with no /usr/bin/tmux). The consequence is that every pod
+# recreate came up with an empty userland — distcc, ccache, everything compiled here,
+# gone — and a human had to remember to put it back.
+#
+# So put it back from the binary package cache, which IS a volume. FEATURES=buildpkg
+# means every build this node ever did already left a reusable package behind, so this
+# is a copy rather than a compile: 23 packages came back in seconds, where building
+# them took the better part of an hour. That is the project's own claim — the machine
+# reconstitutes from a lockfile plus its own cache — applied to its own boot.
+#
+# It asks for the CACHED ATOMS, not for @aios. `emerge --usepkgonly @aios` aborts in
+# dependency resolution on the first member with no binary package — "there are no
+# binary packages to satisfy dev-vcs/git" — and installs NOTHING, including the ten
+# packages it did have. --keep-going does not cover that: the failure is resolution,
+# not a build. So aios.repo.cached-atoms reports the intersection and that is what is
+# emerged.
+#
+# --usepkgonly so a restore can never quietly become an hour-long compile; --noreplace
+# so an already-present package is left alone. ccache and distcc are off for this one
+# emerge because they are part of what is being restored, and portage warns about a
+# FEATURE whose binary is not there yet.
+restore_atoms=$(python3 -m aios.repo cached-atoms 2>/dev/null || echo '')
+if [ "${AIOS_RESTORE:-1}" = 1 ] && [ -n "$restore_atoms" ]; then
+    # Word splitting is wanted here: the atoms are one emerge command line.
+    # shellcheck disable=SC2086
+    FEATURES="-ccache -distcc" emerge --usepkgonly --noreplace --keep-going \
+        --quiet --quiet-build=y $restore_atoms >/var/log/aios-restore.log 2>&1 || true
+    have=$(echo "$restore_atoms" | wc -w | tr -d ' ')
+    back=$(ls -d /var/db/pkg/*/* 2>/dev/null | wc -l | tr -d ' ')
+    step ok "packages" "$back installed, $have restorable from this node's own cache"
+else
+    note "packages" "no binpkg cache yet — first build on this node compiles from source"
+fi
+
+# Services this node offers the network, started here rather than by hand.
+#
+# The Service objects (aios-repo:8080 for the tree/binpkgs/src, :3632 for distccd)
+# resolve the moment the pod reports Ready, so anything not running by then is a
+# dangling endpoint as far as a peer is concerned — it gets a refused connection from
+# a name that claims to be a repo. Starting them at boot is what makes the published
+# surface true. Neither is required for the machine to BE itself, so a failure here is
+# a note rather than a failed check, and must not cost the boot its generation.
+serving() { { netstat -ltn 2>/dev/null || ss -ltn 2>/dev/null; } | grep -q "[:.]$1 "; }
+
+if ! serving 8080; then
+    (python3 -m aios.repo serve >>/var/log/aios-repo.log 2>&1 &) 2>/dev/null
+    sleep 1
+fi
+if serving 8080; then
+    step ok "repo server" "tree, binpkgs and src on :8080"
+else
+    note "repo server" "not listening on :8080 — see /var/log/aios-repo.log"
+fi
+
+# distccd: this node ACCEPTS compile jobs, it does not only send them. Without it the
+# mesh has clients and no capacity, which is why `aios.mesh distcc` reports an empty
+# host list and every build runs wherever it was started.
+#
+# The allow list is the private ranges rather than one CIDR because the client may be
+# in this pod (127.0.0.1), another pod (the cluster's pod CIDR), or another machine on
+# the LAN reaching in through a forwarded port — and distccd refuses, rather than
+# ignores, an address it was not told about. It is an unauthenticated protocol, so the
+# cluster boundary is doing the real confinement here: kind-cluster.yaml binds no host
+# ports, so nothing outside reaches :3632 without an explicit forward.
+if command -v distccd >/dev/null 2>&1; then
+    if ! serving 3632; then
+        install -d -o distcc -g distcc /var/log/distcc 2>/dev/null || true
+        distccd --daemon --user distcc \
+            --allow 127.0.0.1/32 --allow 10.0.0.0/8 \
+            --allow 172.16.0.0/12 --allow 192.168.0.0/16 \
+            --port 3632 --jobs "${AIOS_DISTCC_JOBS:-6}" \
+            --log-file /var/log/distcc/distccd.log \
+            --log-level "${AIOS_DISTCCD_LOG_LEVEL:-info}" 2>/dev/null || true
+        sleep 1
+    fi
+    if serving 3632; then
+        step ok "distccd" "accepting compile jobs on :3632"
+    else
+        note "distccd" "installed but not listening on :3632"
+    fi
+else
+    note "distccd" "sys-devel/distcc not installed — this node sends but cannot accept"
+fi
+
 if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
     step ok "ai provider" "${AIOS_MODEL:-claude-haiku-4-5-20251001}"
 else
@@ -111,6 +199,34 @@ if [ "$ical" -eq 0 ]; then
     [ -n "$gen" ] && step ok "generation" "#$gen"
 else
     note "generation" "not counted — $ical required check(s) failed"
+fi
+
+# Name this incarnation: aios-<generation>-<the name the machine minted for itself>.
+#
+# Three pods built from one spec are all called `aios`, which is how a stale image got
+# mistaken for a fresh one and how a node reported code it was not running. The name
+# carries the generation precisely because that is the part that changes and the part
+# that misleads.
+#
+# The kernel hostname is best-effort and usually will NOT change: sethostname(2) needs
+# CAP_SYS_ADMIN in the UTS namespace and this pod does not have it. So the name is made
+# authoritative where a human actually reads it — the environment and the shell prompt —
+# rather than being reported as set when the kernel refused.
+nodehost=$(py 'from aios import identity; print(identity.hostname())')
+if [ -n "$nodehost" ]; then
+    hostname "$nodehost" 2>/dev/null || true
+    export AIOS_HOSTNAME="$nodehost"
+    {
+        printf 'export AIOS_HOSTNAME=%s\n' "$nodehost"
+        printf "PS1='\\[\\033[38;5;117m\\]%s\\[\\033[2m\\]:\\w\\[\\033[0m\\] \\$ '\\n" "$nodehost"
+    } > /etc/profile.d/aios-hostname.sh 2>/dev/null || true
+    if [ "$(hostname 2>/dev/null)" = "$nodehost" ]; then
+        step ok "hostname" "$nodehost"
+    else
+        step ok "hostname" "$nodehost  (prompt and env; kernel hostname needs CAP_SYS_ADMIN)"
+    fi
+else
+    note "hostname" "could not compose a node name"
 fi
 
 printf '\n'
