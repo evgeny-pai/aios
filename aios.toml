@@ -11,12 +11,20 @@ makeopts = "-j8"
 
 # buildpkg is load-bearing, not an optimisation: forge minimize rebuilds a package
 # once per lever, and a node serves its binary packages to the rest of the network.
+# ccache and distcc are the other two halves of making that affordable, and they
+# compose in this order: ccache answers first, and only a miss goes out to distcc.
+# Both are here rather than in the lock because FEATURES is spec-owned — a live
+# lowering did propose "ccache buildpkg parallel-fetch" and was overruled for it
+# (see the note in aios.lock.json), which is why a human has to write it once.
+# distcc distributes individual compile jobs; WHICH machines it distributes to is
+# topology and never enters the lockfile — `python3 -m aios.mesh distcc` reads that
+# from the mesh at build time, and no host at all means every compile runs here.
 # The sandbox set is off because this machine is a container — portage's ipc/pid/
 # network sandboxes call unshare(), which a stock pod cannot do:
 #   Unable to unshare: EPERM (for FEATURES="pid-sandbox")
 # and userpriv then fails to chmod files it does not own. On real hardware, drop the
 # negations; this line describes THIS machine, which is the point of the spec.
-features = "buildpkg parallel-fetch -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox"
+features = "buildpkg parallel-fetch ccache distcc -sandbox -usersandbox -userpriv -ipc-sandbox -network-sandbox -pid-sandbox"
 
 [agent]
 provider = "anthropic"         # anthropic | openai | ollama | echo
@@ -52,3 +60,10 @@ probes = []
 [[intent]]
 text   = "rebuild the same package repeatedly without recompiling what did not change: a compiler cache sized for a few full package builds, shared across every build on this machine"
 probes = ["ccache"]
+
+# The cache above makes the SECOND build of something cheap. This makes the first one
+# cheap, when there is anyone to share it with — and says nothing about who that is,
+# because that changes hourly and the lockfile has to be stable.
+[[intent]]
+text   = "when this machine is compiling something large and other machines on the network are offering spare capacity, hand them the individual compile jobs instead of doing all of them here; when nobody is offering, compile everything locally without treating that as a failure"
+probes = ["distcc"]

@@ -162,6 +162,33 @@ def sync(*, profile: Profile | None = None, force: bool = False) -> str:
     )
 
 
+#: Deliberately NOT `AIOS_REPO_PORT`. Kubernetes injects legacy Docker-link variables
+#: for every Service in the namespace, and the Service that publishes this very server
+#: is named `aios-repo` — so the cluster sets
+#:
+#:     AIOS_REPO_PORT=tcp://10.96.210.93:8080
+#:
+#: and the server died on its own Service's name:
+#:     ValueError: invalid literal for int() with base 10: 'tcp://10.96.210.93:8080'
+#:
+#: Renaming ours is the fix; the Service name is the peers' API and must not move.
+PORT_ENV = "AIOS_SERVE_PORT"
+
+
+def _port(default: int = SERVE_PORT) -> int:
+    """The port to serve on, tolerating the k8s URL form if it ever reaches us again."""
+    raw = (os.environ.get(PORT_ENV) or "").strip()
+    if not raw:
+        return default
+    if "://" in raw:  # tcp://10.96.210.93:8080 — take the port, not the whole URL
+        raw = raw.rsplit(":", 1)[-1]
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"aios.repo: {PORT_ENV}={raw!r} is not a port; using {default}", file=sys.stderr)
+        return default
+
+
 def serve(port: int = SERVE_PORT) -> None:
     """Publish this node's tree and binary packages to the rest of the network.
 
@@ -221,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                 force="--force" in argv,
             ))
         elif command == "serve":
-            serve(int(os.environ.get("AIOS_REPO_PORT", SERVE_PORT)))
+            serve(_port())
         elif command == "client":
             print(client_config(argv[1] if len(argv) > 1 else "aios-repo"))
         else:

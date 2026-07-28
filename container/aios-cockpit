@@ -1,0 +1,70 @@
+#!/bin/sh
+# Build — or repair — the three-pane cockpit. Idempotent.
+#
+#   aios-cockpit            ensure the layout exists in the current session
+#   C-b R                   the same thing, from inside tmux
+#
+# This exists because closing a pane used to strand you. Panes 0 and 1 were closed
+# by accident and the session was left with only the dashboard: no prompt, no shell,
+# and no way back short of killing the server and losing the session. A cockpit you
+# can dismantle but not rebuild is a trap.
+#
+# Deliberately additive. It never kills a pane and never touches what is running in
+# one, because the pane you did NOT close may be mid-build. It only fills in what is
+# missing, so running it on a healthy cockpit does nothing at all.
+set -u
+
+CONF=/etc/aios/tmux.conf
+SESSION="${AIOS_SESSION:-aios}"
+AIOS_ROOT="${AIOS_ROOT:-/aios}"
+WINDOW="$SESSION:machine"
+T="tmux -f $CONF"
+
+# Panes inherit nothing from this script, so every command carries its own
+# environment. A pane that comes back without PYTHONPATH looks alive and is useless.
+ENV_PREFIX="cd $AIOS_ROOT; export AIOS_ROOT=$AIOS_ROOT PYTHONPATH=$AIOS_ROOT"
+
+if ! $T has-session -t "$SESSION" 2>/dev/null; then
+    echo "aios-cockpit: no session '$SESSION' — start one with: aios" >&2
+    exit 1
+fi
+
+panes=$($T list-panes -t "$WINDOW" 2>/dev/null | wc -l | tr -d ' ')
+[ -z "$panes" ] && panes=0
+
+if [ "$panes" -ge 3 ]; then
+    echo "cockpit intact: $panes panes"
+    exit 0
+fi
+
+echo "cockpit has $panes pane(s); rebuilding the missing ones"
+
+# One pane left: it keeps whatever it is running and becomes the right-hand column,
+# because the dashboard is the pane people leave open. `-b` inserts the new pane
+# BEFORE it, and tmux renumbers by position, so the prompt lands back at index 0.
+if [ "$panes" -eq 1 ]; then
+    $T split-window -h -b -l 62% -t "$WINDOW.0" \
+        "$ENV_PREFIX; python3 -m aios.welcome; python3 -m aios.dashboard keys; \
+         python3 -m aios.agent; exec bash -l"
+    panes=2
+fi
+
+# Two panes: the left column needs its shell underneath.
+if [ "$panes" -eq 2 ]; then
+    $T split-window -v -l 35% -t "$WINDOW.0" "$ENV_PREFIX; exec bash -l"
+fi
+
+# Restart the dashboard only if nothing is already drawing it — a running supervisor
+# must not end up with a second copy fighting it for the pane.
+last=$(($($T list-panes -t "$WINDOW" | wc -l | tr -d ' ') - 1))
+if ! $T list-panes -t "$WINDOW" -F '#{pane_current_command}' | grep -q python; then
+    $T send-keys -t "$WINDOW.$last" \
+        "clear; $ENV_PREFIX; python3 -m aios.supervisor; exec bash -l" Enter
+fi
+
+$T select-pane -t "$WINDOW.0" -T prompt
+$T select-pane -t "$WINDOW.1" -T shell
+$T select-pane -t "$WINDOW.$last" -T dashboard
+$T select-pane -t "$WINDOW.0"     # the prompt, and it stays the prompt
+
+$T list-panes -t "$WINDOW" -F '  #{pane_index} #{pane_title}  #{pane_width}x#{pane_height}'

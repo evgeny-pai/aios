@@ -198,9 +198,42 @@ python3 -m aios.repo client aios-repo  # print the portage config a peer needs
 treated as fabricated and replaced. It is the precondition for every emerge on a fresh
 node, not an optimisation. `client` prints the `PORTAGE_BINHOST` / `getbinpkg` lines a
 peer needs — but not into `/etc/portage`, which is rendered from the lockfile and
-overwritten by the next `render`. Consuming a peer's cache is not wired up: `forge` can
-emit `--getbinpkg` (`emerge_argv(binhost=True)`) and `binhost_env`, and no command yet
-calls either.
+overwritten by the next `render`.
+
+The other network this node is on is the **build mesh** — the ConductorAI share daemon
+running on each host, reached from the pod at `AIOS_MESH_URL`
+(`http://host.docker.internal:4748`) with `CONDUCTORAI_SHARE_TOKEN` from a k8s secret.
+`aios.mesh` asks it whether some machine has already compiled what this node is about
+to compile:
+
+```bash
+python3 -m aios.mesh status             # endpoint, token, CHOST, who can build it
+python3 -m aios.mesh peers              # one line per machine, with its capacity
+eval "$(python3 -m aios.mesh env)"      # PORTAGE_BINHOST for a peer's cache
+emerge --getbinpkg --usepkg --binpkg-respect-use=y <atom>
+```
+
+No mesh is the normal case and nothing raises on its account. `env` prints
+`${CONDUCTORAI_SHARE_TOKEN}` rather than the token, so its output is safe to paste;
+`aios.mesh.build_env()` is the one thing that puts the real value in a URL, and it
+composes `forge.portage.binhost_env` rather than restating it. A peer can only save
+time: `--binpkg-respect-use=y` makes portage reject a prebuilt package whose USE flags
+disagree with the lockfile and build from source instead.
+
+A peer can also, in principle, take one *compile job* rather than a whole package —
+`FEATURES="distcc"` is in `system.features`, and the host list comes from the mesh:
+
+```bash
+python3 -m aios.mesh distcc             # the hosts, and what is not listening on them
+eval "$(python3 -m aios.mesh distcc)"   # DISTCC_HOSTS, in the environment as always
+forge build --distcc --execute          # the same thing, wired into the build
+```
+
+Read the stderr that comes with it. Nothing on this mesh runs `distccd` — ConductorAI
+advertises cores and serves finished packages, it does not accept compile jobs — so
+the host list is usually empty, distcc falls back to the local compiler, and the build
+works exactly as it did before. That fallback is the normal case here and
+`forge probe distcc` asserts it, so a quiet LAN is never a red probe.
 
 Code updates take DESIGN.md §5's shape one level down: never mutate the running tree.
 `python3 -m aios.update publish 4` packages this node's code into `$AIOS_SRC_DIR`; on a

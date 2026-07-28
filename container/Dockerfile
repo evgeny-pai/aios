@@ -43,10 +43,11 @@ COPY README.md DESIGN.md MANUAL.md /aios/
 COPY container/aios-init /sbin/aios-init
 COPY container/aios-login /sbin/aios-login
 COPY container/manual /usr/local/bin/manual
+COPY container/aios-cockpit /usr/local/bin/aios-cockpit
 # Machine-owned, loaded with `tmux -f`, so the two-pane layout intent[3] asks for is
 # a property of the machine and not of whoever last edited a dotfile.
 COPY container/tmux.conf /etc/aios/tmux.conf
-RUN chmod +x /sbin/aios-init /sbin/aios-login /usr/local/bin/manual \
+RUN chmod +x /sbin/aios-init /sbin/aios-login /usr/local/bin/manual /usr/local/bin/aios-cockpit \
     && ln -sf /sbin/aios-login /usr/local/bin/aios \
     # A real `forge` on PATH, not just the shell alias in profile.d. The agent's
     # run_shell tool executes a non-interactive shell that never sources profile,
@@ -70,8 +71,10 @@ COPY aios/ /aios/aios/
 # Fail the build rather than ship a machine whose userland does not import.
 RUN python3 -c "import forge, aios.welcome, aios.agent, aios.tools, aios.llm" \
     && python3 -m forge --lock /aios/aios.lock.json show > /dev/null \
-    && python3 -m unittest discover -s tests -t . 2>&1 | tail -1 \
-    && python3 -m unittest aios.test_agent 2>&1 | tail -1
+    # Every suite the image carries, not a subset: an image that ships a broken
+    # cockpit or mesh client is as unusable as one with a broken build tool, and the
+    # only cheap moment to find out is here.
+    && python3 -m aios.update gate /aios
 
 LABEL org.opencontainers.image.title="AIos" \
       org.opencontainers.image.description="A Linux that compiles itself from stated intent." \

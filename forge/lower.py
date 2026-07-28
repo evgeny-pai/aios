@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 
 from . import lock as lock_mod
+from . import portage as portage_mod
 from . import spec as spec_mod
 from .provider import Provider
 
@@ -114,9 +115,13 @@ Rules, in order of importance:
 5. Respect the target: the given arch, libc and init system. Never assume
    systemd, X11, or a graphical session. On musl, note in `notes` any package
    you know to be glibc-dependent instead of silently adding it.
-6. `make.conf` entries are global build policy (a base USE set, FEATURES, ...).
-   CHOST, CFLAGS, CXXFLAGS, MAKEOPTS and ACCEPT_KEYWORDS are owned by the spec —
-   do not emit them; they will be discarded.
+6. `make.conf` entries are global build policy (a base USE set, PKGDIR, ...).
+   CHOST, CFLAGS, CXXFLAGS, MAKEOPTS, ACCEPT_KEYWORDS and FEATURES are owned by
+   the spec — do not emit them; they will be discarded. PORTAGE_BINHOST and
+   DISTCC_HOSTS are refused outright: naming another machine describes the
+   network at this moment rather than the machine being built, and both are set
+   per build from the environment. An intent about sharing or distributing
+   compilation is served by the packages it needs, never by a host list.
 7. Bind each package to the probe names the spec offers that would exercise it.
    Probes are the only guardrail for later feature minimization, so a package
    with no probe can never be minimized. If an intent has no probe that covers
@@ -201,6 +206,25 @@ def validate(payload: dict, spec: spec_mod.Spec) -> dict:
                 raise LoweringError(f"make_conf[{index}].{key} must be a string")
         if not entry["key"].strip():
             raise LoweringError(f"make_conf[{index}].key is empty")
+        # The renderer's rule, enforced where the untrusted text arrives. `lock.build`
+        # refuses PORTAGE_BINHOST and DISTCC_HOSTS by *key*, so without this a value
+        # of `foo"\nDISTCC_HOSTS="peer/8` under an allowed key renders both variables
+        # into make.conf, the digest stamps over it, and two nodes with the same spec
+        # get different portage trees — the one thing the lockfile exists to prevent.
+        reason = portage_mod.make_conf_reason(
+            entry["key"].strip(), entry["value"], entry["why"]
+        )
+        if reason:
+            raise LoweringError(f"make_conf[{index}]: {reason}")
+        # Stricter here than in the renderer, and only here: `CXXFLAGS="${CFLAGS}"`
+        # is a line forge itself writes, but a model proposing an expansion is
+        # proposing something whose meaning depends on portage's environment at
+        # build time rather than on the lockfile.
+        if "$" in entry["value"]:
+            raise LoweringError(
+                f"make_conf[{index}].value contains '$': a lowering pass does not get "
+                "to write a shell expansion into build policy"
+            )
 
     notes = payload.get("notes", [])
     if not isinstance(notes, list) or any(not isinstance(n, str) for n in notes):

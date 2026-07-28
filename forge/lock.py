@@ -35,6 +35,15 @@ FORBIDDEN = {
         "network topology is not part of the machine's description. Use "
         "`forge build --peer <url>` or AIOS_BINHOST, which set it per build."
     ),
+    # The same rule one level down: a binhost names who has already compiled, a
+    # distcc host list names who could compile right now. Both go stale the moment a
+    # laptop closes, and both would make two nodes with identical specs render
+    # different portage trees. FEATURES="distcc" is the half that IS spec-owned.
+    "DISTCC_HOSTS": (
+        "which machines can compile for this one is network topology, not the "
+        "machine's description. Use `forge build --distcc` or "
+        '`eval "$(python3 -m aios.mesh distcc)"`, which set it per build.'
+    ),
 }
 
 

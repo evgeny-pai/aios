@@ -149,11 +149,26 @@ spec:
           value: xterm-256color
         - name: COLORTERM
           value: truecolor
+        # The ConductorAI share daemon runs on the HOST, not in the cluster, and
+        # binds 0.0.0.0:4748. host.docker.internal is the only route a pod has to
+        # it. A URL is not a credential, so it belongs here; the token does not.
+        - name: AIOS_MESH_URL
+          value: http://host.docker.internal:4748
       envFrom:
-        # optional: the pod must boot when no credentials have been created yet,
-        # and must never be blocked from starting by their absence.
+        # Both optional: the pod must boot when no credentials have been created
+        # yet, and must never be blocked from starting by their absence. A machine
+        # off the mesh with no model key is still a machine that boots and serves.
         - secretRef:
             name: aios-agent
+            optional: true
+        # CONDUCTORAI_SHARE_TOKEN. Created out-of-band from ~/.conductorai/config.json
+        # for the same reason as aios-agent — a manifest that declares a credential
+        # destroys it on every apply:
+        #
+        #   kubectl -n aios create secret generic aios-mesh \
+        #     --from-literal=CONDUCTORAI_SHARE_TOKEN="$(...)"
+        - secretRef:
+            name: aios-mesh
             optional: true
       volumeMounts:
         - name: state

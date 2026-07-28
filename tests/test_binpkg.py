@@ -26,6 +26,7 @@ from unittest import mock
 
 from forge import binpkg as binpkg_mod
 from forge import lock as lock_mod
+from forge import portage as portage_mod
 from forge.cli import main
 
 # --- fixtures ---------------------------------------------------------------
@@ -849,6 +850,213 @@ class TestIuseDrift(Fixture):
         self.assertTrue(any("kernel_linux" in r.text for r in verdict.of_kind("note")))
 
 
+class TestEbuildDefaults(Fixture):
+    """The live failure: `forge binpkg` said `exact` about a vim portage refused.
+
+    `forge binpkg app-editors/vim` reported `exact` while the same emerge rejected the
+    package with "use flag configuration mismatch". Both were looking at the same file
+    and only one of them was computing portage's answer: `fit` compared the flags the
+    LOCKFILE names, and portage compares the package's USE against the USE it computes
+    for this machine — which starts from the ebuild's own IUSE defaults. vim is
+    `+crypt`, the peer's package had crypt off, and the lockfile never mentioned crypt,
+    so forge saw no disagreement anywhere and answered the operator's "why did this
+    rebuild instead of reusing" with the most confidently wrong word available.
+    """
+
+    #: app-editors/vim as a peer built it. `+crypt` and `+nls` are the ebuild's own
+    #: defaults; neither is in USE, and the lockfile names neither.
+    VIM = {
+        "CATEGORY": "app-editors\n",
+        "PF": "vim-9.1.0866\n",
+        "BUILD_ID": "1\n",
+        "BUILD_TIME": "1785172222\n",
+        "SLOT": "0\n",
+        "SIZE": "4194304\n",
+        "CHOST": "aarch64-unknown-linux-musl\n",
+        "CFLAGS": "-O2 -pipe\n",
+        "CXXFLAGS": "-O2 -pipe\n",
+        "IUSE": "X acl +crypt cscope -debug gpm lua minimal +nls perl python sound "
+                "tcl terminal\n",
+        "USE": "acl arm64 elibc_musl kernel_linux terminal\n",
+        "IUSE_EFFECTIVE": "X acl arm64 +crypt cscope -debug elibc_musl gpm kernel_linux "
+                          "lua minimal +nls perl python sound tcl terminal\n",
+        "NEEDED.ELF.2": "arm64;/usr/bin/vim;;;libtinfow.so.6,libc.so;\n",
+        "REQUIRES": "arm64: libc.so libtinfow.so.6\n",
+    }
+
+    #: Every flag the lockfile decides for vim. crypt and nls are deliberately absent:
+    #: that silence is the whole bug.
+    VIM_LOCK_USE = [
+        {"flag": "X", "enabled": False, "why": "intent[0]: no X11 or clipboard"},
+        {"flag": "acl", "enabled": True, "why": "intent[2]: ACLs survive an edit"},
+        {"flag": "terminal", "enabled": True, "why": "intent[3]: :term inside vim"},
+        {"flag": "lua", "enabled": False, "why": "no intent asked for lua scripting"},
+        {"flag": "perl", "enabled": False, "why": "no intent asked for perl scripting"},
+        {"flag": "python", "enabled": False, "why": "no intent asked for python scripting"},
+    ]
+
+    def vim_lock(self, use: list[dict] | None = None, **kwargs) -> dict:
+        return lock_mod.load(write_lock(
+            self.tmp,
+            packages=[pkg("app-editors/vim", self.VIM_LOCK_USE if use is None else use)],
+            **kwargs,
+        ))
+
+    def read_vim(self, **files) -> binpkg_mod.Metadata:
+        return binpkg_mod.read(gpkg(self.tmp, files=dict(self.VIM, **files),
+                                    basename="vim-9.1.0866-1"))
+
+    def test_iuse_defaults_are_read_and_the_flag_names_stay_clean(self):
+        meta = self.read_vim()
+        self.assertEqual(meta.defaults, frozenset({"crypt", "nls"}))
+        self.assertIn("crypt", meta.iuse)          # the name, without its marker
+        self.assertNotIn("+crypt", meta.iuse)
+        self.assertIs(meta.feature("crypt"), False)
+        self.assertEqual(meta.default_off(), frozenset({"crypt", "nls"}))
+
+    def test_default_on_flag_missing_from_use_is_not_exact(self):
+        """The reported failure, end to end: no lock disagreement, and portage rebuilds."""
+        meta = self.read_vim()
+        lock = self.vim_lock()
+        self.assertNotIn("crypt", binpkg_mod.decisions(lock, "app-editors/vim"),
+                         "the fixture no longer reproduces the case: the lock names crypt")
+        verdict = binpkg_mod.fit(meta, lock)
+        self.assertEqual(verdict.verdict, binpkg_mod.REBUILD,
+                         [r.text for r in verdict.reasons])
+        self.assertFalse(verdict.ok, "a package emerge will rebuild counted as reusable")
+        self.assertEqual(verdict.of_kind("flag", "unknown"), ())  # every named flag agrees
+        text = verdict.of_kind("default")[0].text
+        self.assertIn("agrees with every flag the lockfile names", text)
+        self.assertIn("2 flag(s)", text)
+        self.assertIn("the lockfile does not constrain crypt", text)
+        self.assertIn("this package has it off and the ebuild defaults it on", text)
+        self.assertIn("IUSE +crypt", text)
+        self.assertIn("rebuilds it", text)
+        self.assertIn("nls", text)
+
+    def test_a_minus_defaulted_flag_absent_from_use_is_agreement(self):
+        """`-debug` is the ebuild declining the flag: the package matching that is a fit.
+
+        The IUSE here keeps its `-debug` marker and drops the two `+` ones, so this also
+        pins that a marked IUSE is believed as-is and IUSE_EFFECTIVE is not consulted
+        behind its back.
+        """
+        meta = self.read_vim(
+            IUSE="X acl crypt cscope -debug gpm lua minimal nls perl python sound tcl "
+                 "terminal\n"
+        )
+        self.assertEqual(meta.defaults, frozenset())
+        verdict = binpkg_mod.fit(meta, self.vim_lock())
+        self.assertEqual(verdict.of_kind("default"), ())
+        self.assertEqual(verdict.verdict, binpkg_mod.EXACT, [r.text for r in verdict.reasons])
+        self.assertTrue(verdict.ok)
+
+    def test_a_default_on_flag_present_in_use_is_agreement(self):
+        """Portage computes +crypt here too, so this one really is a reuse.
+
+        Reporting it as a flag emerge would rebuild over would be this same bug pointed
+        the other way — and the exit code is a prediction about emerge, not a grade.
+        """
+        meta = self.read_vim(USE="acl arm64 crypt elibc_musl kernel_linux nls terminal\n")
+        verdict = binpkg_mod.fit(meta, self.vim_lock())
+        self.assertEqual(verdict.of_kind("default"), ())
+        self.assertEqual(verdict.of_kind("extra"), ())
+        self.assertEqual(verdict.verdict, binpkg_mod.EXACT, [r.text for r in verdict.reasons])
+        self.assertTrue(verdict.ok)
+        # ...and the flag the lockfile never constrained is still said out loud.
+        said = verdict.of_kind("unconstrained")[0].text
+        self.assertIn("the lockfile does not constrain crypt", said)
+        self.assertIn("has it on and the ebuild defaults it on", said)
+
+    def test_iuse_effective_supplies_the_defaults_when_iuse_lost_its_markers(self):
+        """Some producers strip IUSE's markers; IUSE_EFFECTIVE is then the only copy."""
+        meta = self.read_vim(
+            IUSE="X acl crypt cscope debug gpm lua minimal nls perl python sound tcl "
+                 "terminal\n"
+        )
+        self.assertEqual(meta.defaults, frozenset({"crypt", "nls"}))
+        verdict = binpkg_mod.fit(meta, self.vim_lock())
+        self.assertEqual(verdict.verdict, binpkg_mod.REBUILD)
+        self.assertIn("the lockfile does not constrain crypt",
+                      verdict.of_kind("default")[0].text)
+
+    def test_a_flag_the_lockfile_disables_is_judged_once_not_twice(self):
+        """A decision overrides the ebuild default, so (2) has already judged it.
+
+        The lockfile disabling crypt is portage computing -crypt: the package built
+        without it is what the machine asked for, and reporting the ebuild's default
+        against it would invent a rebuild that will not happen.
+        """
+        verdict = binpkg_mod.fit(self.read_vim(), self.vim_lock(
+            use=self.VIM_LOCK_USE + [
+                {"flag": "crypt", "enabled": False, "why": "intent[4]: no encrypted files"},
+                {"flag": "nls", "enabled": False, "why": "intent[4]: one language, C locale"},
+            ],
+        ))
+        self.assertEqual(verdict.of_kind("default"), ())
+        self.assertEqual(verdict.verdict, binpkg_mod.EXACT, [r.text for r in verdict.reasons])
+        self.assertTrue(verdict.ok)
+
+    def test_a_globally_disabled_default_is_agreement_too(self):
+        """`-crypt` in make.conf USE is as binding as `-crypt` on the package line."""
+        verdict = binpkg_mod.fit(self.read_vim(), self.vim_lock(global_use="-X -crypt -nls"))
+        self.assertEqual(verdict.of_kind("default"), ())
+        self.assertEqual(verdict.verdict, binpkg_mod.EXACT, [r.text for r in verdict.reasons])
+
+    def test_a_global_flag_the_package_lacks_is_still_a_wildcard(self):
+        """The rule `test_globally_enabled_flag_the_package_lacks_is_not_a_mismatch` pins.
+
+        A global `USE="ssl"` asks for ssl wherever it exists; vim has no ssl flag, so
+        the default check must not turn that into a demand while it reports crypt.
+        """
+        verdict = binpkg_mod.fit(self.read_vim(), self.vim_lock(global_use="-X ssl"))
+        self.assertEqual(verdict.of_kind("unknown"), ())
+        self.assertEqual(verdict.verdict, binpkg_mod.REBUILD)
+        text = verdict.of_kind("default")[0].text
+        self.assertIn("crypt", text)
+        self.assertNotIn("ssl", text)
+
+    def test_a_real_mismatch_outranks_the_default_clash_and_both_are_printed(self):
+        """`mismatch` is worse: it denies something an intent asked for."""
+        meta = self.read_vim(USE="X acl arm64 elibc_musl kernel_linux terminal\n")
+        verdict = binpkg_mod.fit(meta, self.vim_lock())
+        self.assertEqual(verdict.verdict, binpkg_mod.MISMATCH)
+        self.assertFalse(verdict.ok)
+        self.assertIn("want -X, built +X", " | ".join(r.text for r in verdict.of_kind("flag")))
+        text = verdict.of_kind("default")[0].text
+        self.assertIn("the lockfile does not constrain crypt", text)
+        # The claim of full agreement is dropped once a named flag was denied.
+        self.assertNotIn("agrees with every flag", text)
+
+    def test_pkguse_names_who_switched_the_ebuilds_default_off(self):
+        """The builder's own package.use is provenance, never a licence."""
+        verdict = binpkg_mod.fit(self.read_vim(PKGUSE="-crypt -nls\n"), self.vim_lock())
+        self.assertEqual(verdict.verdict, binpkg_mod.REBUILD)
+        self.assertIn("PKGUSE carried -crypt", verdict.of_kind("default")[0].text)
+
+    def test_a_defaulted_use_expand_member_is_reported_not_judged(self):
+        """The profile owns these and the lockfile does not record the profile."""
+        meta = self.read_vim(
+            IUSE="X acl +crypt cscope -debug gpm lua minimal +nls perl python sound tcl "
+                 "terminal +python_targets_python3_13\n",
+            USE="acl arm64 crypt elibc_musl kernel_linux nls terminal\n",
+        )
+        self.assertIn("python_targets_python3_13", meta.defaults)
+        verdict = binpkg_mod.fit(meta, self.vim_lock())
+        self.assertEqual(verdict.of_kind("default"), ())
+        self.assertEqual(verdict.verdict, binpkg_mod.EXACT, [r.text for r in verdict.reasons])
+
+    def test_cli_prints_rebuild_and_withholds_exit_zero(self):
+        lock = write_lock(self.tmp, packages=[pkg("app-editors/vim", self.VIM_LOCK_USE)])
+        path = gpkg(self.tmp, files=self.VIM, basename="vim-9.1.0866-1")
+        code, out = self.run_cli("--lock", str(lock), "binpkg", str(path))
+        self.assertEqual(code, 1, out)
+        self.assertIn("rebuild", out)
+        self.assertIn("1 rebuild", out)          # and it is counted as its own verdict
+        self.assertIn("0/1 reusable", out)
+        self.assertIn("the lockfile does not constrain crypt", out)
+
+
 class TestUseExpand(Fixture):
     """USE_EXPAND variables in make.conf are build policy exactly like USE.
 
@@ -1014,8 +1222,12 @@ class TestSources(Fixture):
             binpkg_mod.peer_sources("file:///var/cache/binpkgs")
 
 
-class TestPeer(Fixture):
-    """A real HTTP server, because the Range handling and the index are the point."""
+class PeerFixture(Fixture):
+    """A real HTTP server serving a binpkg tree, plus an index with one escaping path.
+
+    Shared rather than inherited between the two peer suites, so neither re-runs the
+    other's cases — one of them builds a 2 MiB package.
+    """
 
     def setUp(self):
         super().setUp()
@@ -1034,6 +1246,10 @@ class TestPeer(Fixture):
         self.addCleanup(self.server.shutdown)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}/binpkgs"
+
+
+class TestPeer(PeerFixture):
+    """The Range handling and the index are the point, so nothing here is mocked."""
 
     def test_peer_index_lists_packages_and_drops_escaping_paths(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1118,6 +1334,112 @@ class TestPeer(Fixture):
             code = main(["--lock", str(lock), "binpkg", "--peer", self.base])
         self.assertEqual(code, 0, out.getvalue())
         self.assertIn("app-misc/tmux-3.5a", out.getvalue())
+
+
+class TestPeerCredential(PeerFixture):
+    """A peer URL authenticates by userinfo, so `--peer` is handed a live token.
+
+    `portage.binhost_env` puts the credential in the URL because portage fetches a
+    binhost with wget/curl and there is no header to set, and `aios.mesh.binhost_url`
+    builds exactly that URL — its own docstring says it is unredacted. `forge build
+    --peer` learned to redact before printing; this command takes the same argument
+    and printed it three ways: the detail line, the `read over plain HTTP from` line
+    (whose `netloc` includes the userinfo), and every read error, which is prefixed
+    with the URL. The same real server, so the credential travels the real path.
+    """
+
+    #: Distinctive enough that a substring search cannot pass by accident, and shaped
+    #: like the mesh token it stands in for.
+    TOKEN = "s3cr3t-mesh-token"
+
+    def authed(self, path: str = "") -> str:
+        scheme, _, rest = self.base.partition("://")
+        return f"{scheme}://x:{self.TOKEN}@{rest}{path}"
+
+    def host_port(self) -> str:
+        return f"127.0.0.1:{self.server.server_address[1]}"
+
+    @contextlib.contextmanager
+    def authenticating_transport(self):
+        """Stand in for a fetcher that can spend the userinfo urllib ignores.
+
+        `urllib` does not implement it: `http.client` takes `Request.host` verbatim, so
+        `http://x:tok@host/` fails DNS rather than authenticating. portage's wget/curl
+        do, which is the whole reason `portage.binhost_env` puts the token in the URL —
+        so the credential handed to `--peer` is real, and today it can only reach an
+        error message. Stripping it in the transport, the one place that legitimately
+        sees it, exercises the reporting paths a working fetcher would reach.
+        """
+        real = binpkg_mod._http_get
+
+        def dial(url, **kwargs):
+            scheme, _, rest = url.partition("://")
+            head, sep, tail = rest.partition("@")
+            return real(f"{scheme}://{tail if sep else head}", **kwargs)
+
+        with mock.patch.object(binpkg_mod, "_http_get", dial):
+            yield
+
+    def test_a_successful_peer_check_names_the_host_and_not_the_token(self):
+        lock = write_lock(self.tmp, packages=[pkg("app-misc/tmux", TMUX_LOCK_USE)])
+        with self.authenticating_transport():
+            code, out = self.run_cli("--lock", str(lock), "binpkg", "--peer", self.authed())
+        self.assertEqual(code, 0, out)
+        self.assertIn("app-misc/tmux-3.5a", out, "the check has to have really run")
+        self.assertNotIn(self.TOKEN, out)
+        # Redacted, not suppressed: which peer answered is the point of the output.
+        self.assertIn(self.host_port(), out)
+        self.assertIn(portage_mod.REDACTION, out)
+
+    def test_a_read_failure_quotes_the_url_redacted(self):
+        """The error path is the leakiest: ~30 messages are prefixed with the source."""
+        lock = write_lock(self.tmp, packages=[pkg("app-misc/tmux", TMUX_LOCK_USE)])
+        with self.authenticating_transport():
+            code, out = self.run_cli("--lock", str(lock), "binpkg",
+                                     self.authed("/app-misc/absent-1.gpkg.tar"))
+        self.assertEqual(code, 1, out)
+        self.assertIn("404", out, "the failure has to be the one we asked for")
+        self.assertNotIn(self.TOKEN, out)
+        self.assertIn(self.host_port(), out)
+
+    def test_the_transport_error_urllib_gives_a_userinfo_url_is_redacted_too(self):
+        """No patched transport here: this is what a real `--peer <token url>` does now.
+
+        urllib hands `x:tok@host:port` to `http.client` as the host, so the fetch dies
+        in DNS — and that message is prefixed with the URL, which is how the token
+        reached the terminal in the first place.
+        """
+        lock = write_lock(self.tmp, packages=[pkg("app-misc/tmux", TMUX_LOCK_USE)])
+        code, out = self.run_cli("--lock", str(lock), "binpkg", "--peer", self.authed())
+        self.assertEqual(code, 1, out)
+        self.assertNotIn(self.TOKEN, out)
+        self.assertIn(portage_mod.REDACTION, out)
+
+    def test_a_dropped_index_entry_does_not_quote_the_token_either(self):
+        """The index is a peer's text, and the line rejecting it names the binhost."""
+        with self.authenticating_transport():
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                sources = binpkg_mod.peer_sources(self.authed())
+        printed = buf.getvalue()
+        self.assertIn("dropped index entry", printed)
+        self.assertNotIn(self.TOKEN, printed)
+        # The URL that gets FETCHED still carries the credential — redacting that one
+        # would break the fetch instead of protecting it.
+        self.assertEqual(len(sources), 1)
+        self.assertIn(self.TOKEN, sources[0])
+
+    def test_the_fit_a_caller_may_log_carries_no_credential(self):
+        """`Fit.source` and `Metadata.source` are report fields, not fetch targets."""
+        lock = self.tmux_lock()
+        with self.authenticating_transport():
+            fit = binpkg_mod.examine(self.authed("/app-misc/tmux-3.5a-1.gpkg.tar"), lock)
+            broken = binpkg_mod.examine(self.authed("/app-misc/absent-1.gpkg.tar"), lock)
+        self.assertEqual(fit.verdict, binpkg_mod.EXACT)
+        for text in (fit.source, fit.meta.source, *(r.text for r in fit.reasons)):
+            self.assertNotIn(self.TOKEN, text)
+        self.assertEqual(broken.verdict, binpkg_mod.ERROR)
+        for text in (broken.source, *(r.text for r in broken.reasons)):
+            self.assertNotIn(self.TOKEN, text)
 
 
 class TestPeerRedirect(Fixture):

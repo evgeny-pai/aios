@@ -215,10 +215,19 @@ cheaper is load-bearing, not an optimisation:
 - **Binary packages from a peer**, with `--binpkg-respect-use=y` so a prebuilt
   package whose flags disagree with the lock is *rejected and rebuilt* rather than
   installed. Reuse may save time; it may not change what you get.
-- Not yet done, in rough order of payoff: `PORTAGE_TMPDIR` on tmpfs (this pod's
-  `/dev/shm` is 64 MB, so it needs a sized memory-backed volume and a memory limit
-  raised to match — an OOM mid-build is worse than a slow build), and `distcc`
-  across the network, which is the obvious use of more than one node.
+- **`distcc`**, the obvious use of more than one node: `FEATURES="distcc"` is
+  spec-owned beside `ccache` (ccache answers first; only a miss goes out to the
+  network), and the host list comes from the mesh at build time —
+  `python3 -m aios.mesh distcc`, `forge build --distcc` — never from the lockfile,
+  for the same reason a binhost never does. The half that does not exist yet is on
+  the other side of the wire: ConductorAI's build support is package-granularity and
+  nothing on the mesh runs distccd, so every host list is empty today and distcc
+  falls back to the local compiler. That fallback is the third check in
+  `probes/distcc.toml` rather than a failure, because a probe that goes red whenever
+  the LAN is quiet would take `forge minimize` down with it.
+- Not yet done: `PORTAGE_TMPDIR` on tmpfs (this pod's `/dev/shm` is 64 MB, so it
+  needs a sized memory-backed volume and a memory limit raised to match — an OOM
+  mid-build is worse than a slow build).
 
 ## 9. Open questions
 

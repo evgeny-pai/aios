@@ -43,7 +43,20 @@ ROOT = Path(os.environ.get("AIOS_ROOT", "/aios"))
 STAGE = Path(f"{ROOT}.next")
 PREVIOUS = Path(f"{ROOT}.prev")
 STATE = ROOT / ".aios"
-VERSION_FILE = STATE / "code-version"
+
+#: The version marker lives WITH the code, not with the per-node state.
+#:
+#: It was in .aios — a mounted volume — and that made it lie. Recreating the pod
+#: reverts /aios to the image (only .aios is persistent), so the marker survived a
+#: code rollback it did not describe: a node reported running `42ca31b78136` while
+#: its lockfile had three packages and `forge` had no `binpkg` subcommand. A version
+#: file that outlives its artifact is worse than no version file, and it is the same
+#: mistake the manifest already documents for /var/db/pkg, which is deliberately not
+#: persisted because it would outlive the /usr binaries it describes.
+#:
+#: Here it is ephemeral on purpose: a recreated node reports "unknown" and takes an
+#: update, which is true, instead of claiming a version it has lost.
+VERSION_FILE = ROOT / ".code-version"
 MANIFEST = "latest.json"
 
 #: What a node's code actually consists of. Deliberately not the whole directory,
@@ -81,6 +94,12 @@ INSTALL = (
 GATE = (
     ("forge", ("-m", "unittest", "discover", "-s", "tests", "-t", ".")),
     ("agent", ("-m", "unittest", "aios.test_agent")),
+    # Named individually rather than discovered, so a candidate that *deletes* a
+    # suite fails the gate instead of quietly passing a smaller one. Suites absent
+    # from a candidate are skipped, because an older release predates them and must
+    # still be installable — a rollback target that cannot be installed is not one.
+    ("cockpit", ("-m", "unittest", "aios.test_cockpit")),
+    ("mesh", ("-m", "unittest", "aios.test_mesh")),
 )
 
 
@@ -337,6 +356,15 @@ def gate(candidate: Path) -> list[str]:
     failures = []
     env = {**os.environ, "PYTHONPATH": str(candidate), "PYTHONDONTWRITEBYTECODE": "1"}
     for name, argv in GATE:
+        # A suite the candidate does not carry is skipped, not failed: an older
+        # release predates it, and a rollback target you cannot install is not one.
+        # Checked by looking for the file rather than by treating "no module named"
+        # as absence — that string is equally what a broken import prints.
+        module = argv[-1] if argv[-2] == "unittest" else ""
+        if module.startswith("aios.") and not (
+            candidate / "aios" / f"{module.split('.', 1)[1]}.py"
+        ).is_file():
+            continue
         try:
             done = subprocess.run(
                 [sys.executable, *argv], cwd=candidate, env=env,

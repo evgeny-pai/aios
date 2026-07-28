@@ -11,14 +11,45 @@ machine it is monitoring.
 **Health is derived, never asserted.** Every token comes out of the journal —
 timestamps and repetition while a run is open (`ok`, `STUCK`, `LOOPING`), and the
 run's own terminal record once it has closed (`done`, `RED`, `ASK`) — so the
-display cannot flatter the machine and no model gets a vote on whether the machine
-is fine. `IDLE` means nothing is running *and* nothing ended: it is not a fault and
+display cannot flatter the machine. No model has a vote on the machine being *fine*:
+the supervisor's judgement, below, can raise an alarm and can never clear one, and
+that asymmetry is the whole of what a model is trusted with here. `IDLE` means
+nothing is running *and* nothing ended: it is not a fault and
 is not coloured like one, because a box with nothing to do is a box working
 correctly. A run that gave up is a different fact from a run that finished, and
 folding both into `IDLE` made the one thing an operator returning to the machine
 needs to know invisible. The heartbeat glyph advances only while an agent is
 actually open, so a still spinner means "nothing is running", not "the display
 froze". It freezes on purpose next to `STUCK`.
+
+**Liveness is scoped to what the *agent* wrote.** `aios.supervisor` appends its own
+advisory lines to this same journal, on purpose: they are audit trail and this pane
+displays them. But a watcher whose own writes count as activity certifies itself
+alive — the one line a human glances at read `ok` through eleven minutes of a stalled
+run *because* the supervisor kept writing about how stalled it was. So every record
+names its writer, and only agent-authored ones move the liveness clock, the
+heartbeat, the set of open agents and the "has anything happened" fingerprint.
+
+The judgement travels the other way. When the supervisor has diagnosed a stall the
+status bar says `STUCK`: a diagnosis that only reaches the advice pane is a diagnosis
+nobody sees. It is retired by *evidence* rather than by arrival — `RETIRE_N`
+agent-authored records newer than the diagnosis, or one that ends the run — because
+the shape of a stall is a loop that keeps logging. Retiring on the next record of any
+kind meant one record per iteration cleared the verdict on every pass, while the only
+thing that can re-raise it is a model call rate-limited to one a minute: the stall
+this half exists to catch was the one stall that could hide from it. The
+`fingerprint` still moves on the first record, so the supervisor gets to look again
+while its verdict stands, and the two halves still cannot confirm each other —
+nothing the watcher writes moves anything measured here.
+
+**Timestamps come out of the journal too.** Every threshold below is a subtraction
+from a number a record supplied, so a single record dated ahead of the clock — a
+skewed clock, a hand-written line — pinned silence at zero and disabled
+`MODEL_SILENCE_S`, `TOOL_SILENCE_S` and `COLD_S` at once, permanently and silently.
+Nothing can have happened later than `now`, so a record's stamp is clamped to it for
+the per-agent clocks, and anything further ahead than `SKEW_S` is not evidence of
+life at all: it is excluded from the liveness clock, counted, and reported. A clock
+that disagrees with the audit trail is itself the kind of fault this pane is for.
 
 **Silence is phase-aware.** A `tool` record is written when the tool *returns*, so
 the journal legitimately goes quiet for the length of an `emerge` — up to
@@ -126,6 +157,19 @@ COLD_S = 7200.0
 #: brake counts verdicts, and this also counts tool calls, which nothing else does.
 LOOP_N = 3
 
+#: Agent records newer than a stall diagnosis before the diagnosis is retired. One is
+#: not evidence: the stalls the supervisor exists to name are the ones that log
+#: steadily and repeat nothing, so a run emitting a record per iteration cleared the
+#: verdict on every pass — and it can only be re-raised once per
+#: `supervisor.ADVICE_EVERY_S`. Two records, or one that ends the run, is progress.
+RETIRE_N = 2
+
+#: How far ahead of the reader's clock a record may be stamped and still be believed.
+#: `now` is sampled before the file is opened, so a record appended in between is
+#: legitimately a few milliseconds in the future; past this it is a skewed clock or a
+#: hand-written line, and either way its timestamp is not evidence of anything.
+SKEW_S = 2.0
+
 #: The heartbeat advances on this grid, so it steps once per `status-interval`.
 BEAT_S = 2.0
 
@@ -192,6 +236,35 @@ def _int(value: object) -> int:
 
 # --- the journal --------------------------------------------------------------
 
+#: Who wrote a record. Two writers share this file — `agent._record` and
+#: `supervisor._log` — and only one of them is the machine doing work. Everything
+#: about liveness below asks this question and nothing else, because keying on the
+#: *kind* means the next thing the watcher learns to write is a new way for the
+#: monitor to look busy to itself.
+AUTHOR_AGENT = "agent"
+AUTHOR_SUPERVISOR = "supervisor"
+
+#: Kinds the supervisor wrote before records carried an author. `advice` is the whole
+#: list: it is the only record that module has ever appended.
+_LEGACY_SUPERVISOR_KINDS = frozenset({"advice"})
+
+
+def _author(record: dict, kind: str) -> str:
+    """Who wrote this record — stated if the writer said so, inferred if it is old.
+
+    Old records carry no `author` at all and must keep rendering, so absence is read
+    as "written before this field existed" and answered from the kind: the agent
+    wrote everything except `advice`. A *present* name is returned as it stands, even
+    one this reader has never heard of — which makes it not the agent, and therefore
+    not activity. That is the safe direction: an unknown writer counted as activity is
+    the exact failure this field exists to prevent, and health must fail towards
+    STUCK, which gets read, rather than towards `ok`, which does not.
+    """
+    stated = record.get("author")
+    if stated is None or not str(stated).strip():
+        return AUTHOR_SUPERVISOR if kind in _LEGACY_SUPERVISOR_KINDS else AUTHOR_AGENT
+    return plain(stated, 40).lower()
+
 
 @dataclass(frozen=True)
 class Event:
@@ -199,6 +272,11 @@ class Event:
     kind: str
     label: str
     data: dict = field(default_factory=dict)
+    author: str = AUTHOR_AGENT
+
+    @property
+    def by_agent(self) -> bool:
+        return self.author == AUTHOR_AGENT
 
 
 def _base(root: Path | str | None) -> Path:
@@ -260,8 +338,9 @@ def _events(lines: Sequence[str]) -> tuple[list[Event], int]:
             ts = float(record.get("ts") or 0.0)
         except (TypeError, ValueError):
             ts = 0.0
+        kind = str(record.get("kind") or "?")
         events.append(
-            Event(ts, str(record.get("kind") or "?"), str(record.get("label") or ""), record)
+            Event(ts, kind, str(record.get("label") or ""), record, _author(record, kind))
         )
     return events, skipped - (1 if mid_append else 0)
 
@@ -316,24 +395,47 @@ class State:
     model: str = ""
     advice: str = ""
     advice_ts: float = 0.0
+    #: The supervisor's last "this run is not progressing", if the agent has not
+    #: written anything since. Empty is the normal case, including while advice is
+    #: being displayed: only a verdict the writer flagged as a stall lands here.
+    stalled: str = ""
     last_ts: float = 0.0
+    #: The newest agent record's timestamp exactly as written, and how many agent
+    #: records carry it. Distinct from `last_ts`, which is clamped to `now` and is
+    #: what every threshold measures: these two are the change signal, and a change
+    #: signal must not move because the clock moved.
+    mark: float = 0.0
+    mark_n: int = 0
+    #: Agent records dated more than `SKEW_S` ahead of `now`. A fault in itself.
+    ahead: int = 0
     ended: Ending = Ending()
     note: str = ""
     skipped: int = 0
 
     @property
     def silence(self) -> float:
+        """How long the *agent* has been quiet. Watcher writes are not activity."""
         return max(0.0, self.now - self.last_ts) if self.last_ts else 0.0
 
     @property
     def fingerprint(self) -> str:
         """Has anything the *agent* did changed since last time.
 
-        Advice records are excluded deliberately: the supervisor appends its own
-        advice to this file, and a fingerprint that counted it would make every
-        advisory call justify the next one for as long as the pane is open.
+        Supervisor-authored records are excluded deliberately: the supervisor appends
+        its own advice to this file, and a fingerprint that counted it would make
+        every advisory call justify the next one for as long as the pane is open —
+        one call a minute into an empty room.
+
+        Which is why this is the newest agent record's own stamp and the number of
+        agent records sharing it, and not a count over the window. The window is the
+        journal's last `TAIL_BYTES`, so counting inside it made the fingerprint move
+        whenever it *slid* — and the supervisor's own advice writes are what slide it,
+        which is the self-feeding signal the rate limit exists to prevent, arriving
+        through the gate that was supposed to stop it. The stamp is the raw one, not
+        `last_ts`: a clamped stamp tracks `now`, and a fingerprint that changes every
+        second buys a model call every minute.
         """
-        return f"{self.last_ts:.6f}/{sum(1 for e in self.events if e.kind != 'advice')}"
+        return f"{self.mark:.6f}/{self.mark_n}"
 
 
 def _names(value: object) -> list[str]:
@@ -450,11 +552,18 @@ def digest(
     The record that closed the last run is kept (`Ending`), because "it gave up" and
     "it finished" are the same shape here — nothing running — and they are not the
     same news.
+
+    Only agent-authored records get any of that. The supervisor's own lines are read
+    for what they say and then skipped: they open no agent, close no run, and do not
+    touch the clock every health token is measured against.
     """
     running: dict[str, Live] = {}
     last_model = ""
     advice, advice_ts = "", 0.0
-    last_ts = 0.0
+    #: The outstanding stall diagnosis, the stamp of the advice that raised it, and how
+    #: many agent records have landed since — see `RETIRE_N`.
+    stalled, stall_ts, evidence = "", 0.0, 0
+    last_ts, mark, mark_n, ahead = 0.0, 0.0, 0, 0
     ended = Ending()
     boundary = 0  # where the current run starts, for the repetition scan
 
@@ -469,60 +578,96 @@ def digest(
 
     for index, event in enumerate(events):
         data, label = event.data, event.label or "main"
-        if event.kind == "advice":
-            advice, advice_ts = plain(data.get("text"), 400), event.ts
-            continue  # the supervisor's own line: not the agent's activity
+        if not event.by_agent:
+            # The watcher's own writes. Displayed, audited, and invisible to every
+            # line below: this is the whole of "a monitor must not be able to read
+            # its own heartbeat as the machine's".
+            if event.kind == "advice":
+                advice, advice_ts = plain(data.get("text"), 400), event.ts
+                # The newest advice supersedes the last one, in both directions: the
+                # writer withdrawing its own verdict is the writer's business.
+                stalled = plain(data.get("text"), 200) if data.get("stall") else ""
+                stall_ts, evidence = event.ts, 0
+            continue
 
-        last_ts = max(last_ts, event.ts)
+        # Nothing can have happened later than now, so this is what the per-agent
+        # clocks and the endings are stamped with — an elapsed time computed against a
+        # record from the future is not a duration.
+        ts = min(event.ts, now)
+        credible = event.ts <= now + SKEW_S
+        if credible:
+            last_ts = max(last_ts, ts)
+        else:
+            # Past the tolerance the stamp is not evidence of anything: not of life,
+            # which is what folding it into `last_ts` silently claimed — that one line
+            # disabled every staleness threshold at once — and not of newness either,
+            # which is why it cannot retire a diagnosis below.
+            ahead += 1
+        # The change signal, off the raw stamp: see `State.fingerprint`.
+        if event.ts > mark:
+            mark, mark_n = event.ts, 1
+        elif event.ts == mark:
+            mark_n += 1
+
+        if stalled and credible and event.ts > stall_ts:
+            # Retired by evidence, not by arrival: a stalled run still logs, and one
+            # record per iteration cleared the verdict faster than the supervisor's
+            # rate limit could re-raise it. A record that ends the run is enough on its
+            # own — that is progress by definition, not another turn of the same loop.
+            evidence += 1
+            if evidence >= RETIRE_N or _is_boundary(event):
+                stalled, evidence = "", 0
         if _is_boundary(event):
             boundary = index + 1
         if event.kind == "request":
             running.clear()
             ended = Ending()  # a new run: the previous outcome is no longer the news
-            touch("main", last_model, event.ts)
+            touch("main", last_model, ts)
         elif event.kind == "spawn":
             model = str(data.get("model") or "")
-            touch(f"sub:{model}", model, event.ts)
+            touch(f"sub:{model}", model, ts)
         elif event.kind in ("spawn_done", "spawn_failed"):
             running.pop(f"sub:{data.get('model') or ''}", None)
         elif event.kind == "reply":
-            live = touch(label, str(data.get("model") or ""), event.ts)
+            live = touch(label, str(data.get("model") or ""), ts)
             last_model = live.model or last_model
             calls = _names(data.get("tool_calls"))
             live.outstanding = len(calls)
             live.awaiting = _awaiting(len(calls))
         elif event.kind == "tool":
-            live = touch(label, "", event.ts)
+            live = touch(label, "", ts)
             live.tool = f"{plain(data.get('name'), 30)} {_tool_detail(data)}".strip()
             # One call of the turn came back. The rest are still out there.
             live.outstanding = max(0, live.outstanding - 1)
             live.awaiting = _awaiting(live.outstanding)
         elif event.kind == "verify":
-            live = touch("main", last_model, event.ts)
+            live = touch("main", last_model, ts)
             live.verdict_ok = bool(data.get("ok"))
             live.verdict = plain(data.get("detail"), 400)
             if live.verdict_ok:
                 running.clear()  # green is the only way a request ends satisfied
-                ended = Ending("verify", live.verdict, event.ts)
+                ended = Ending("verify", live.verdict, ts)
         elif event.kind in ("stuck", "needs_decision"):
             running.clear()
             said = data.get("detail") if event.kind == "stuck" else data.get("question")
-            ended = Ending(event.kind, plain(said, 400), event.ts, _int(data.get("repeats")))
+            ended = Ending(event.kind, plain(said, 400), ts, _int(data.get("repeats")))
         elif event.kind == "budget":
             if label == "main":
                 running.clear()
-                ended = Ending("budget", plain(data.get("detail"), 400), event.ts)
+                ended = Ending("budget", plain(data.get("detail"), 400), ts)
             else:
                 running.pop(label, None)
         elif event.kind in ("escalate", "deferral"):
-            touch("main", last_model, event.ts)
+            touch("main", last_model, ts)
 
     silence = max(0.0, now - last_ts) if last_ts else 0.0
     cold = bool(last_ts) and silence > COLD_S
     agents = () if cold else tuple(running.values())
     health, why = _health(
-        agents, events[boundary:], now, last_ts, note, bool(running) and cold, ended
+        agents, events[boundary:], now, last_ts, note, bool(running) and cold, ended, stalled
     )
+    if ahead:
+        health, why = _skewed(health, why, ahead, bool(last_ts))
 
     return State(
         now=now,
@@ -534,11 +679,35 @@ def digest(
         model=(agents[-1].model if agents and agents[-1].model else last_model),
         advice=advice,
         advice_ts=advice_ts,
+        stalled=stalled,
         last_ts=last_ts,
+        mark=mark,
+        mark_n=mark_n,
+        ahead=ahead,
         ended=ended,
         note=note,
         skipped=skipped,
     )
+
+
+def _skewed(health: str, why: str, ahead: int, measurable: bool) -> tuple[str, str]:
+    """Report the records dated ahead of the clock, and say so first if it is all we have.
+
+    Surfaced rather than normalised away: a record from the future is a fault in its
+    own right — a skewed clock, or a line somebody wrote by hand into an append-only
+    machine-written file — and it is the one input that can make every threshold above
+    unreachable at once. When it is the *only* thing in the journal there is no
+    liveness left to measure, and an unmeasurable machine fails towards `STUCK`, the
+    token that gets read, rather than towards "nothing has run yet", which does not.
+    """
+    if not measurable:
+        return HEALTH_STUCK, f"{ahead_of_clock(ahead)}, and nothing credible to measure"
+    return health, f"{why}; {ahead_of_clock(ahead)}"
+
+
+def ahead_of_clock(ahead: int) -> str:
+    """Said once, because both surfaces say it — and the pane is 34 columns wide."""
+    return f"{ahead} record(s) ahead of the clock"
 
 
 def _awaiting(outstanding: int) -> str:
@@ -555,8 +724,26 @@ def _health(
     note: str,
     abandoned: bool,
     ended: Ending,
+    stalled: str = "",
 ) -> tuple[str, str]:
-    """`window` is the current run's events only — anything earlier is another run."""
+    """`window` is the current run's events only — anything earlier is another run.
+
+    `stalled` is the supervisor's outstanding "this is not progressing", and it is the
+    only input here that did not come out of the machine's own records. It is ranked
+    below both signals that did: `looping` and the silence thresholds name what is
+    wrong from the journal itself, and a diagnosis is only needed for the stalls those
+    two cannot see — the eleven-minute exploratory loop that logs steadily and repeats
+    nothing. It can only ever raise an alarm, never clear one, so the worst a wrong
+    line of advice buys is a STUCK a human reads and disagrees with.
+
+    That makes *dropping* it the one unsafe direction, and it was dropped in the worst
+    case there is: consulted only while an agent was open, a flagged stall vanished the
+    moment the run went quiet past `COLD_S` — a machine hung with nobody home reported
+    the faint `IDLE` of a box with nothing to do. So the two arms that would otherwise
+    say IDLE consult it too. The arm that does not is `ended`: a terminal record is the
+    machine's own account of how the run closed, `RED` and `ASK` are already alarms,
+    and any of those records retires the diagnosis anyway (`RETIRE_N`).
+    """
     if not last_ts:
         return HEALTH_IDLE, note or "nothing has run yet"
 
@@ -570,13 +757,20 @@ def _health(
             return HEALTH_STUCK, (
                 f"nothing logged for {ago(silence)}, waiting for {agents[-1].awaiting}"
             )
+        if stalled:
+            return HEALTH_STUCK, f"supervisor: {stalled}"
         if silence <= FRESH_S:
             return HEALTH_OK, f"last event {ago(silence)} ago"
         return HEALTH_OK, f"waiting for {agents[-1].awaiting}, {ago(silence)} so far"
     if abandoned:
-        return HEALTH_IDLE, f"a run went quiet {ago(silence)} ago without an ending"
+        quiet = f"a run went quiet {ago(silence)} ago without an ending"
+        if stalled:
+            return HEALTH_STUCK, f"{quiet} — supervisor: {stalled}"
+        return HEALTH_IDLE, quiet
     if ended.kind:
         return _outcome(ended, max(0.0, now - ended.ts))
+    if stalled:
+        return HEALTH_STUCK, f"no agent running — supervisor: {stalled}"
     return HEALTH_IDLE, f"no agent running, last event {ago(silence)} ago"
 
 
@@ -891,6 +1085,10 @@ def watch_rows(
     head += [_row((plain(note, body), "faint")) for note in notes]
     if state.skipped:
         head.append(_row((f"{state.skipped} unreadable line(s)", "faint")))
+    if state.ahead:
+        # Not faint, unlike the two above: an unreadable line loses one record, a
+        # record from the future was quietly voiding every threshold on this pane.
+        head.append(_row((ahead_of_clock(state.ahead), "warn")))
 
     head.append(_heading("agents", str(len(state.agents)), body))
     head += _agent_rows(state, body, glyphs, marks)

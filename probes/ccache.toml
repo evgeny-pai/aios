@@ -45,5 +45,10 @@ test -f "$T/a.o"
 [[check]]
 name = "portage is configured to use it"
 script = '''
-emerge --info 2>/dev/null | grep -oE 'FEATURES="[^"]*"' | grep -q ccache
+# A configuration assertion, and named as one — checks 1-3 above are what prove the
+# cache works. Whole-word match, the same shape as probes/distcc.toml: a bare
+# `grep -q ccache` passes on FEATURES="-ccache", which is the setting that turns the
+# feature OFF, and on an unrelated "ccache-something". aios.toml puts ccache in
+# FEATURES specifically so this check passes, which makes the difference load-bearing.
+emerge --info | grep -oE 'FEATURES="[^"]*"' | grep -qE '[ "]ccache[ "]'
 '''

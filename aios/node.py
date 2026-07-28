@@ -9,8 +9,9 @@ the node the others depend on".
 So the role is not written into the prompt as prose. It is *measured* here, every
 session, from state that cannot lie about itself: does a real tree exist, is the port
 actually listening, what digest was last published, which peer does this node consume
-from. A briefing assembled from those facts is right even after the role changes, and
-it cannot drift the way a hardcoded paragraph does.
+from, and what the build mesh is offering right now (`aios.mesh`). A briefing
+assembled from those facts is right even after the role changes, and it cannot drift
+the way a hardcoded paragraph does.
 
 Read-only and cheap. Nothing here starts a service or mints anything — a briefing
 that changes the machine by being displayed is not a briefing.
@@ -24,6 +25,7 @@ import socket
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import mesh as mesh_mod
 from . import repo
 
 SRC = Path("/srv/aios/src")
@@ -42,6 +44,11 @@ class Role:
     binpkgs: int = 0
     published: str = ""         # version of the last release advertised
     peer: str = ""              # where this node takes updates from, if anywhere
+    #: What the build mesh offered when this was measured. `None` means it was not
+    #: measured at all, which the briefing renders the same way as "no mesh" —
+    #: a Role constructed by hand (tests, a caller with facts of its own) must not
+    #: be able to trigger a network call by being displayed.
+    mesh: mesh_mod.Mesh | None = None
 
     @property
     def is_seed(self) -> bool:
@@ -76,7 +83,8 @@ def _binpkgs() -> int:
         return 0
 
 
-def role() -> Role:
+def role(transport: mesh_mod.Transport | None = None) -> Role:
+    """Measure this node. One short mesh request; `mesh_mod.look` never raises."""
     tree, detail = repo.looks_real()
     return Role(
         tree=tree,
@@ -85,6 +93,7 @@ def role() -> Role:
         binpkgs=_binpkgs(),
         published=_published(),
         peer=os.environ.get("AIOS_UPDATE_URL", ""),
+        mesh=mesh_mod.look(transport),
     )
 
 
@@ -137,6 +146,11 @@ def briefing(current: Role | None = None) -> str:
             "    python3 -m aios.repo sync        get a tree of your own, or",
             "    python3 -m aios.update check     see what the seed is offering",
         ]
+
+    # What the rest of the network can do FOR this node, as opposed to what this node
+    # owes it. An agent that does not know a peer has already compiled the package it
+    # is about to compile will compile it — the briefing is the only place it finds out.
+    lines += ["", mesh_mod.briefing(r.mesh)]
 
     lines += [
         "",

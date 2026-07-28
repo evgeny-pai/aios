@@ -37,7 +37,7 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import agent, llm, tools
+from . import agent, dashboard, llm, tools
 
 # --- fake transport -----------------------------------------------------------
 
@@ -1043,6 +1043,11 @@ class TestLoop(Base):
         self.assertEqual(records[2]["name"], "list_dir")
         self.assertFalse(records[2]["is_error"])
         self.assertTrue(records[-1]["ok"])
+        # Every record says who wrote it. `aios.supervisor` appends to this same file
+        # and `aios.dashboard` derives the machine's health from it, so unsigned work
+        # and unsigned commentary about the work are indistinguishable — which is a
+        # monitor that reports `ok` because it is busy saying the run is stuck.
+        self.assertTrue(all(r["author"] == dashboard.AUTHOR_AGENT for r in records))
 
 
 # --- the coordinator may not quit ---------------------------------------------

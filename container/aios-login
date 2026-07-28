@@ -84,6 +84,28 @@ start() {
         tmux -f "$CONF" send-keys -t "$1" "$2" Enter
 }
 
+# Defined here, not inherited: aios-init has its own copies, but this script is also
+# run directly as `aios`, and under `set -u` an undefined colour variable aborts the
+# login outright — a cosmetic detail taking the whole session down with it.
+if [ -n "${NO_COLOR:-}" ]; then
+    DIM=''; WARN=''; OFF=''
+else
+    DIM=$(printf '\033[2m'); WARN=$(printf '\033[38;5;179m'); OFF=$(printf '\033[0m')
+fi
+
+# Say why there is no cockpit, rather than quietly handing over a bare prompt.
+#
+# This fell back silently once and the machine simply "looked old": tmux lives under
+# /usr, which is the ephemeral layer, so recreating the pod removed it and the guard
+# below stopped matching. No dashboard, no explanation, and the obvious conclusion
+# was that the new image had shipped without one. A degraded mode that does not
+# announce itself is indistinguishable from a regression.
+if [ "${AIOS_SPLIT:-1}" != 0 ] && ! command -v tmux >/dev/null 2>&1; then
+    printf '%s  no cockpit: tmux is not installed, so this is the plain prompt.%s\n' "$WARN" "$OFF"
+    printf '%s  It is in the lockfile and a binary you built is cached — reinstall with:%s\n' "$DIM" "$OFF"
+    printf '%s    emerge --usepkgonly --oneshot app-misc/tmux && exec aios%s\n\n' "$DIM" "$OFF"
+fi
+
 if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     CONF=/etc/aios/tmux.conf
     SESSION="${AIOS_SESSION:-aios}"

@@ -346,6 +346,29 @@ GENERATED = {
     "forge.journal.jsonl": "the minimization journal is an append-only record of real builds.",
 }
 
+#: The same rule for artifacts whose *path* is the fact, not their name. A file called
+#: `agent.jsonl` in a scratch directory is the agent's own business; the one at this
+#: path is the audit journal the machine's health is read out of. Keyed on the
+#: root-relative path so the check cannot be sidestepped by writing a same-named file
+#: somewhere else — and cannot fire on one either.
+#:
+#: Stated here rather than imported from `dashboard`: this module is the tool surface
+#: and does not depend on the display. `test_cockpit` asserts the two agree.
+JOURNAL_PATH = ".aios/agent.jsonl"
+
+GENERATED_AT = {
+    JOURNAL_PATH: (
+        "the audit journal is append-only and machine-written. Every request, tool "
+        "call, verdict and escalation is recorded there as it happens, and each record "
+        "names its writer — which is what lets the dashboard tell the machine's own "
+        "work from the supervisor's commentary, and therefore whether the machine is "
+        "alive at all. A record written by hand can claim any writer and any timestamp, "
+        "so hand-writing this file does not report a fault, it removes the one signal "
+        "that would have. Nothing needs you to write it: the harness appends what you "
+        "do as you do it. Read it freely — cat, tail and grep all work."
+    ),
+}
+
 #: Package code: what upstream ships and what the overlay forges from it. Editing
 #: any of it on the agent's own initiative is how a configuration change quietly
 #: becomes a private fork.
@@ -379,11 +402,12 @@ def _package_code(relative: Path) -> str:
 
 def _write_file(ctx: Context, args: dict) -> str:
     path = _resolve(ctx, args["path"])
-    reason = GENERATED.get(path.name)
-    if reason and path.parent == ctx.root.resolve():
-        raise ToolError(f"refused to write {path.name}: {reason}")
-
     relative = _rel(ctx, path)
+    reason = GENERATED.get(path.name) if path.parent == ctx.root.resolve() else ""
+    reason = reason or GENERATED_AT.get(Path(relative).as_posix(), "")
+    if reason:
+        raise ToolError(f"refused to write {relative}: {reason}")
+
     if not ctx.allow_package_edits:
         what = _package_code(Path(relative))
         if what:
@@ -443,7 +467,13 @@ _NOT_FORGE = r"(?![^;&|]*-m\s+forge\b)"
 #: `cat`, `grep`, `sha256sum`, `forge diff` all stay allowed — so every pattern here
 #: is a write shape. This is rule 1 of the machine rather than the package gate, so
 #: it holds even with /allow-package-edits open, exactly as write_file's does.
-_ARTIFACT = r"(?:aios\.lock\.json|forge\.journal\.jsonl)"
+#:
+#: `agent.jsonl` is here for the same reason it is in `GENERATED_AT`, and it is here
+#: *because* it is there: a door enforced on write_file alone is a door the model does
+#: not need to use. Unqualified by directory, unlike the write_file check — a shell
+#: redirect names a path, and `>> .aios/agent.jsonl` and `cd .aios && >> agent.jsonl`
+#: are the same write. A scratch file of that name is the one thing this costs.
+_ARTIFACT = r"(?:aios\.lock\.json|forge\.journal\.jsonl|agent\.jsonl)"
 GENERATED_WRITE = (
     (rf">>?\s*[^\s;&|]*{_ARTIFACT}", "redirecting into a generated artifact"),
     (rf"\btee\b[^;&|]*{_ARTIFACT}", "writing a generated artifact with tee"),
@@ -454,13 +484,15 @@ GENERATED_WRITE = (
 )
 
 GENERATED_REFUSAL = (
-    "aios.lock.json and forge.journal.jsonl are generated, never authored — through a "
-    "shell redirect exactly as much as through write_file, and root does not soften "
-    "that. Change aios.toml and run forge_lower: it regenerates the lock, reseals the "
-    "digest, and records why every flag is set. Hand-computing a digest to match a "
-    "hand-patched lockfile is a model back in the build path, which is the one thing "
-    "this machine's design forbids. Reading the file is fine — cat, grep and forge "
-    "show all work."
+    "aios.lock.json, forge.journal.jsonl and .aios/agent.jsonl are generated, never "
+    "authored — through a shell redirect exactly as much as through write_file, and "
+    "root does not soften that. Change aios.toml and run forge_lower: it regenerates "
+    "the lock, reseals the digest, and records why every flag is set. Hand-computing a "
+    "digest to match a hand-patched lockfile is a model back in the build path, which "
+    "is the one thing this machine's design forbids; hand-writing the audit journal is "
+    "the same move against the record of what you did, and it is the file this "
+    "machine's health is read out of. Reading any of them is fine — cat, tail, grep "
+    "and forge show all work."
 )
 
 # The same standing as CATASTROPHIC, for the same reason: run_shell is arbitrary

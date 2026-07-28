@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
         return args.handler(args) or 0
     except (Fail, spec_mod.SpecError, lock_mod.LockError, probe_mod.ProbeError,
             provider_mod.ProviderError, lower_mod.LoweringError,
-            minimize_mod.MinimizeError, binpkg_mod.BinpkgError) as exc:
+            minimize_mod.MinimizeError, binpkg_mod.BinpkgError,
+            portage_mod.RenderError) as exc:
         print(f"forge: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -84,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--root", default="/", help="build into this root")
     p.add_argument("--execute", action="store_true", help="really build (default is --pretend)")
     p.add_argument("--peer", default="", help="reuse a peer's binary packages, e.g. http://aios-repo:8080/binpkgs (env: AIOS_BINHOST). Prebuilt packages whose USE flags disagree with the lock are rejected, not installed")
+    p.add_argument("--distcc", action="store_true", help="take the mesh's compile hosts as DISTCC_HOSTS. Needs FEATURES=distcc in the spec and a distccd on each peer; with neither, every compile runs locally and the build still works")
     p.set_defaults(handler=cmd_build)
 
     p = sub.add_parser(
@@ -239,15 +242,46 @@ def cmd_build(args) -> int:
     argv = portage_mod.emerge_argv(
         lock, root=args.root, pretend=not args.execute, binhost=bool(peer)
     )
-    env = None
+    # Both accelerators are environment-only, and for one reason: which machines are
+    # up is a fact about this moment. The lockfile refuses either key by name.
+    overrides: dict[str, str] = {}
     if peer:
         # A peer's binary packages are an accelerator, never an authority: portage
         # still resolves the graph from the rendered lockfile, and --binpkg-respect-use
         # makes it reject any prebuilt package whose flags disagree and build from
         # source instead. So reuse can save time but cannot change what you get.
-        env = {**os.environ, **portage_mod.binhost_env(peer)}
-        print(f"reusing binary packages from {peer} where the USE flags match",
-              file=sys.stderr)
+        overrides.update(portage_mod.binhost_env(peer))
+        # Redacted, because the natural way to produce this argument is
+        # `--peer "$(python3 -c 'import aios.mesh; print(aios.mesh.binhost_url())')"`
+        # and `binhost_url` says in its own docstring that it is unredacted — the
+        # token is in the userinfo. Printing it verbatim would put a live credential
+        # on a terminal and, under the agent, into `.aios/agent.jsonl` forever.
+        print(f"reusing binary packages from {portage_mod.redact_url(peer)} "
+              "where the USE flags match", file=sys.stderr)
+    if args.distcc:
+        # A host list is only half of a distributed build. The other half is whether
+        # portage routes compiles through distcc at all, and that half is in the lock
+        # already loaded above — so check it rather than reporting a quiet mesh and
+        # letting the reader debug the network for a lockfile problem.
+        if not _FEATURE_DISTCC.search(_feature_line(lock)):
+            print(
+                "the lockfile's FEATURES has no `distcc`, so portage will not route "
+                "compiles through it —\nDISTCC_HOSTS is exported and ignored, and "
+                "every compile runs locally. Run\n`forge lower && forge render` "
+                "first (`forge diff` says whether this lock predates the spec).",
+                file=sys.stderr,
+            )
+        # Imported here, not at module scope: forge is the pure pipeline and has to
+        # stay importable on a machine that carries no node code at all. The mesh is
+        # asked once, and it never raises — no mesh means an empty host list, which
+        # is a local build rather than a failure.
+        from aios import mesh as mesh_mod
+
+        view = mesh_mod.look()
+        hosts = mesh_mod.distcc_hosts(view)
+        overrides.update(portage_mod.distcc_env(hosts))
+        print(mesh_mod.distcc_note(hosts, view), file=sys.stderr)
+    env = {**os.environ, **overrides} if overrides else None
     if shutil.which("emerge") is None:
         print("emerge is not on PATH — this host cannot build. Would run:")
         print("  " + " ".join(argv))
@@ -277,8 +311,10 @@ def cmd_binpkg(args) -> int:
     # Zero is a prediction that emerge will REUSE these, so it is withheld from
     # anything portage would rebuild or a reader should not trust: a mismatch, a
     # foreign build, a package that could not be read, a package whose USE flags are
-    # contradicted by what its binaries link, and one carrying an enabled feature no
-    # intent justified — `--binpkg-respect-use=y` rejects that last one too.
+    # contradicted by what its binaries link, one that disagrees with the ebuild's own
+    # IUSE defaults on a flag the lockfile never constrained (`rebuild` — portage
+    # recomputes USE from those defaults), and one carrying an enabled feature no
+    # intent justified — `--binpkg-respect-use=y` rejects those last two too.
     return 0 if all(item.ok for item in fits) else 1
 
 
@@ -345,6 +381,19 @@ def cmd_minimize(args) -> int:
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+#: Whole-word, the same way `probes/distcc.toml` asks the question of `emerge
+#: --info`: a `-distcc` negation or a `distcc-pump` entry is not this feature.
+_FEATURE_DISTCC = re.compile(r"(?:^|\s)distcc(?:\s|$)")
+
+
+def _feature_line(lock: dict) -> str:
+    """The lockfile's FEATURES value. "" if the lock somehow carries none."""
+    for entry in lock["make_conf"]:
+        if entry["key"] == "FEATURES":
+            return str(entry["value"])
+    return ""
 
 
 def _warn_missing_probes(spec: spec_mod.Spec, directory: str) -> None:

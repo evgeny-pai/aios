@@ -16,7 +16,20 @@ appears in IUSE and not in USE. tmux's lockfile entry names debug, systemd,
 utempter and vim-syntax as disabled and none of them appear in USE — compare raw
 USE against the lock and all four read as missing rather than as agreeing.
 
-The second thing this does is cheaper than it looks. The lockfile records
+The second subtlety is the one that produced a confidently wrong answer on a live
+machine. Portage does not compare a binary package against the flags the LOCKFILE
+names; it compares it against the USE it computes for this machine, and that
+computation starts from the ebuild's own IUSE defaults. vim is `+crypt`. A peer's
+vim built without crypt therefore agrees with every flag an AIos lockfile names —
+and portage still refuses it with "use flag configuration mismatch" and rebuilds.
+Comparing only the decided flags made `forge binpkg` answer `exact` to precisely
+the question the operator was asking, which is worse than answering nothing. So
+IUSE's `+`/`-` markers are read rather than stripped (IUSE_EFFECTIVE is the second
+copy when a producer stripped them), and a flag the ebuild asks for that the
+package lacks is a `rebuild` verdict naming the flag. `exact` means portage would
+install it; no weaker evidence may claim that word.
+
+The third thing this does is cheaper than it looks. The lockfile records
 *negative* intent ("-X  intent[0]: no X11"), and `NEEDED.ELF.2` records what the
 installed binaries actually link. A package built with -X that still links
 libX11 is the same class of defect as a vacuously-green probe
@@ -55,6 +68,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import lock as lock_mod
+from . import portage as portage_mod
 
 DEFAULT_PKGDIR = "/var/cache/binpkgs"
 
@@ -86,8 +100,18 @@ MANIFEST_HASHES = ("SHA512", "BLAKE2B", "SHA256")
 
 EXACT, USABLE, MISMATCH, FOREIGN, ERROR = "exact", "usable", "mismatch", "foreign", "error"
 
+#: Fits every flag the lockfile names, and portage will STILL rebuild it: the
+#: package disagrees with the ebuild's own IUSE defaults on a flag the lockfile
+#: never constrained. Its own verdict because it is neither `exact` (portage does
+#: not install it) nor `mismatch` (nothing the lockfile asked for was denied) —
+#: and because "why did this node rebuild instead of reusing" is the question this
+#: command exists to answer, so the answer needs a word of its own.
+REBUILD = "rebuild"
+
 #: Ordered worst-last so a verdict can only be made worse as evidence arrives.
-_SEVERITY = {EXACT: 0, USABLE: 1, MISMATCH: 2, FOREIGN: 3, ERROR: 4}
+#: `rebuild` sits above `usable` and below `mismatch`: portage refuses both, but a
+#: mismatch also contradicts something an intent asked for.
+_SEVERITY = {EXACT: 0, USABLE: 1, REBUILD: 2, MISMATCH: 3, FOREIGN: 4, ERROR: 5}
 
 #: Flags portage sets from the profile, not from an ebuild's IUSE. Never treated
 #: as package features — the IUSE intersection already excludes them, and this
@@ -222,6 +246,16 @@ class Metadata:
     slot: str = ""
     use: frozenset[str] = frozenset()
     iuse: frozenset[str] = frozenset()
+    #: Flags the EBUILD asks for by default — the leading `+` in IUSE, or in
+    #: IUSE_EFFECTIVE when IUSE arrived with its markers stripped. Portage folds
+    #: these into the USE it computes for this machine, so they decide reuse exactly
+    #: as a lockfile decision does, and a lockfile that never names one is not
+    #: agreement with it.
+    defaults: frozenset[str] = frozenset()
+    #: Flags the BUILDER's own package.use switched off (PKGUSE `-flag`). Provenance
+    #: for a default that lost — it names who overrode the ebuild, and nothing more.
+    #: A peer's config is never evidence that its choice is right for this machine.
+    pkguse_off: frozenset[str] = frozenset()
     cflags: str = ""
     cxxflags: str = ""
     chost: str = ""
@@ -258,6 +292,16 @@ class Metadata:
         if flag not in self.iuse:
             return None
         return flag in self.use
+
+    def default_off(self) -> frozenset[str]:
+        """Flags the ebuild defaults ON that this package was nevertheless built without.
+
+        No IUSE intersection is needed here and none is applied: a `+` marker is the
+        ebuild itself both offering the flag and asking for it, so absence from USE is
+        a switch-off — which is the one case `--binpkg-respect-use=y` rejects while
+        the lockfile stays silent.
+        """
+        return frozenset(flag for flag in self.defaults if flag not in self.use)
 
     def sonames(self) -> frozenset[str]:
         """Every library any installed binary links, from whichever source exists."""
@@ -819,11 +863,25 @@ def _assemble(raw: _Raw, source: str, archive_size: int) -> Metadata:
     use = _tokens(determined(
         "USE", "no USE in metadata — nothing can be said about enabled flags"
     ) or "")
-    iuse = frozenset(flag.lstrip("+-") for flag in _tokens(determined(
+    iuse_tokens = _tokens(determined(
         "IUSE",
         "no IUSE in metadata — a flag missing from USE cannot be told apart "
         "from one this package never offered",
-    ) or ""))
+    ) or "")
+    iuse = frozenset(flag.lstrip("+-") for flag in iuse_tokens)
+    # The `+`/`-` markers are the ebuild's defaults, and portage starts the USE it
+    # computes for this machine from them — so stripping them and keeping only the
+    # names is what let a vim built without `+crypt` read as `exact`.
+    defaults = _defaults(iuse_tokens)
+    if not _marked(iuse_tokens):
+        # An unmarked IUSE is ambiguous: an ebuild with no defaults looks exactly like
+        # a producer that stripped them, so this is never reported as a gap. It is
+        # only a reason to look at IUSE_EFFECTIVE, which sometimes kept its markers.
+        defaults = _defaults(_tokens(files.get("IUSE_EFFECTIVE", "")))
+    pkguse_off = frozenset(
+        flag[1:] for flag in _tokens(files.get("PKGUSE", ""))
+        if flag.startswith("-") and len(flag) > 1
+    )
 
     needed = _parse_needed_elf2(files.get("NEEDED.ELF.2", "")) or _parse_needed(
         files.get("NEEDED", "")
@@ -856,6 +914,8 @@ def _assemble(raw: _Raw, source: str, archive_size: int) -> Metadata:
         slot=files.get("SLOT", "").strip(),
         use=use,
         iuse=iuse,
+        defaults=defaults,
+        pkguse_off=pkguse_off,
         cflags=" ".join(files.get("CFLAGS", "").split()),
         cxxflags=" ".join(files.get("CXXFLAGS", "").split()),
         chost=chost,
@@ -872,6 +932,22 @@ def _assemble(raw: _Raw, source: str, archive_size: int) -> Metadata:
 
 def _tokens(text: str) -> frozenset[str]:
     return frozenset(text.split())
+
+
+def _defaults(tokens: frozenset[str]) -> frozenset[str]:
+    """Flags an ebuild asks for by default: IUSE's leading `+`, as in "+crypt debug -X"."""
+    return frozenset(flag[1:] for flag in tokens if flag.startswith("+") and len(flag) > 1)
+
+
+def _marked(tokens: frozenset[str]) -> bool:
+    """True when these IUSE tokens still carry the ebuild's `+`/`-` markers.
+
+    Only ever used to decide whether IUSE_EFFECTIVE is worth reading for a second
+    copy. It cannot be used to report a missing-defaults gap: most ebuilds genuinely
+    have no defaults, and tmux's real IUSE has none, so "no markers" would condemn
+    almost every honest package.
+    """
+    return any(flag.startswith(("+", "-")) for flag in tokens)
 
 
 def _int(text: str) -> int:
@@ -941,7 +1017,8 @@ def _parse_needed(text: str) -> tuple[Elf, ...]:
 class Reason:
     """One piece of evidence, naming what it was read from."""
 
-    # flag | chost | arch | libc | link | cflags | extra | expand | unknown | note | error
+    # flag | chost | arch | libc | link | cflags | extra | expand | default |
+    # unconstrained | unknown | note | error
     kind: str
     text: str
 
@@ -963,6 +1040,11 @@ class Fit:
         return self.of_kind("link")
 
     @property
+    def rebuilt_by_default(self) -> tuple[Reason, ...]:
+        """Fits the lock, and portage rebuilds it anyway over an ebuild default."""
+        return self.of_kind("default")
+
+    @property
     def ok(self) -> bool:
         """Fit, fully understood, and every enabled feature justified by an intent.
 
@@ -974,6 +1056,13 @@ class Fit:
         IUSE could not be read (`unknown`) is one it cannot even compare. Both used
         to exit 0 under a "usable" verdict, promising a reuse that would not happen.
         A feature with no `why` is also the thing README rule 2 exists to prevent.
+
+        `rebuild` is excluded by the verdict alone, for the same reason: portage
+        recomputes USE from the ebuild's defaults and refuses the package. An
+        `unconstrained` reason is NOT excluded — there portage computes the same value
+        the package was built with and reuses it, so predicting a rebuild would be
+        this command's own bug repeated backwards. That gap belongs to `forge lower`,
+        which should have decided the flag, and the reason line says so.
         """
         return self.verdict in (EXACT, USABLE) and not self.of_kind("link", "extra", "unknown")
 
@@ -1204,8 +1293,24 @@ def fit(meta: Metadata, lock: dict, atom: str | None = None) -> Fit:
     undecided = {flag for flag in meta.use
                  if flag not in decided and (flag in meta.iuse or not _profile_set(flag))}
     undecided -= wrong_member
+    # ...with one population taken out of `extra` first: a flag the EBUILD defaults on
+    # and the lockfile never constrained is enabled in the USE portage computes here
+    # too, so portage reuses the package. Saying "emerge rebuilds over this" about it
+    # would be the same false confidence as the `exact` this section was built to fix,
+    # pointed the other way — the gap is in the lockfile, not in the package.
+    from_default = sorted(f for f in undecided if f in meta.defaults and not _expand_group(f))
+    undecided -= set(from_default)
     extra = sorted(f for f in undecided if not _expand_group(f))
     expanded = sorted(f for f in undecided if _expand_group(f))
+    if from_default:
+        reasons.append(
+            Reason("unconstrained", "; ".join(
+                f"the lockfile does not constrain {flag}; this package has it on and the "
+                f"ebuild defaults it on" for flag in from_default
+            ) + " — portage computes the same value for this machine, so it reuses the "
+                "package. Said out loud because the feature is in the system with no intent "
+                "recording why (README rule 2): decide it in the lockfile, not here")
+        )
     if extra:
         reasons.append(
             Reason("extra", "built +" + ", +".join(extra) + " — no decision in the lockfile "
@@ -1219,6 +1324,22 @@ def fit(meta: Metadata, lock: dict, atom: str | None = None) -> Fit:
             Reason("expand", "built +" + ", +".join(expanded) + " — USE_EXPAND members the "
                              "profile sets and the lockfile does not record; reported, not judged")
         )
+
+    # 3b. The whole reason this section exists. `--binpkg-respect-use=y` compares the
+    #     package's USE against the USE PORTAGE computes for this machine, and that
+    #     computation starts from the ebuild's own IUSE defaults — not from the flags
+    #     the lockfile happens to name. So a package can agree with every decision in
+    #     the lock and still be refused, which is the case an operator hits as "forge
+    #     said exact, emerge rebuilt it anyway". A flag the lockfile DOES name is
+    #     excluded whichever way it went: the lock overrides the ebuild default, so
+    #     (2) above has already judged it against the value portage will compute.
+    clash = sorted(
+        flag for flag in meta.default_off()
+        if flag not in decided and not _profile_set(flag)
+    )
+    if clash:
+        reasons.append(Reason("default", _default_clash(meta, clash, reasons)))
+        worsen(REBUILD)
 
     if not meta.iuse:
         reasons.append(
@@ -1265,6 +1386,36 @@ def fit(meta: Metadata, lock: dict, atom: str | None = None) -> Fit:
         worsen(USABLE)
 
     return Fit(verdict=verdict, atom=atom, reasons=tuple(reasons), meta=meta, source=meta.source)
+
+
+def _default_clash(meta: Metadata, flags: list[str], reasons: list[Reason]) -> str:
+    """The sentence for a package that fits the lockfile and portage will still rebuild.
+
+    Written to answer the operator's question in one line — which flag, whose default,
+    and what emerge will do about it — and to say what is UNCONSTRAINED rather than
+    implying the lockfile disagreed. `reasons` is read only to know whether the claim
+    "agrees with every flag the lockfile names" is still true when this line is added.
+    """
+    denied = any(r.kind in ("flag", "unknown") for r in reasons)
+    clauses = []
+    for flag in flags:
+        clause = (f"the lockfile does not constrain {flag}; this package has it off and "
+                  f"the ebuild defaults it on (IUSE +{flag})")
+        if flag in meta.pkguse_off:
+            clause += f", and the builder's own PKGUSE carried -{flag}"
+        clauses.append(clause)
+    head = "" if denied else "agrees with every flag the lockfile names, but "
+    return (
+        f"{head}disagrees with this package's own defaults on {len(flags)} flag(s) the "
+        f"lockfile never constrained — portage computes "
+        f"{' '.join('+' + flag for flag in flags)} for this machine from the ebuild's IUSE "
+        f"defaults, so `emerge --binpkg-respect-use=y` (portage.emerge_argv) refuses this "
+        f"package with a use flag configuration mismatch and rebuilds it: "
+        + "; ".join(clauses)
+        + ". Decide these in the lockfile if the package is right for this machine, or "
+        "rebuild it. A profile use.mask can also switch a defaulted flag off and the "
+        "lockfile does not record the profile — that is the one way this line is wrong."
+    )
 
 
 def _expand_group(flag: str) -> str:
@@ -1362,13 +1513,26 @@ def examine(source: str, lock: dict, *, atom: str | None = None,
     try:
         meta = fetch(source, timeout=timeout) if _is_url(source) else read(source)
     except BinpkgError as exc:
-        return Fit(verdict=ERROR, atom=atom or Path(source).name,
-                   reasons=(Reason("error", str(exc)),), source=source)
+        return Fit(verdict=ERROR, atom=atom or Path(_shown(source)).name,
+                   reasons=(Reason("error", str(exc)),), source=_shown(source))
     return fit(meta, lock, atom)
 
 
 def _is_url(source: str) -> bool:
     return urllib.parse.urlparse(source).scheme in ("http", "https")
+
+
+def _shown(source: str) -> str:
+    """A source as a human, a log or a Fit may carry it — never its userinfo.
+
+    A peer's binhost URL authenticates by userinfo, because portage fetches it with
+    wget/curl and there is no header to set (`portage.binhost_env`). `--peer` is
+    therefore routinely handed a live credential — `aios.mesh.binhost_url()` builds
+    exactly that URL and says in its own docstring that it is unredacted. Every string
+    below that a human can end up reading goes through here; only the argument to
+    `_http_get` stays whole, because that one has to dial.
+    """
+    return portage_mod.redact_url(source)
 
 
 def peer_sources(url: str, *, timeout: float = PEER_TIMEOUT) -> list[str]:
@@ -1386,7 +1550,8 @@ def peer_sources(url: str, *, timeout: float = PEER_TIMEOUT) -> list[str]:
     out: list[str] = []
     for rel in _index_paths(index.decode("utf-8", "replace")):
         if rel.startswith("/") or ".." in rel.split("/") or "://" in rel or "\\" in rel:
-            print(f"forge binpkg: dropped index entry {rel!r} — it points outside {base}")
+            print(f"forge binpkg: dropped index entry {rel!r} — it points outside "
+                  f"{_shown(base)}")
             continue
         out.append(f"{base}/{rel}")
     return out
@@ -1425,8 +1590,12 @@ def fetch(url: str, *, timeout: float = PEER_TIMEOUT,
     # file, and a slice's tail is a boundary the fetcher chose rather than the end
     # of anything. `read_stream` is told which it has.
     partial = len(blob) >= probe_bytes
+    # The redacted URL is what goes in, and it is the choke point for the ~30 parse
+    # errors below it: `read_stream` prefixes every one with this string, and it also
+    # becomes `Metadata.source`, which `fit` copies into the Fit the caller prints.
+    named = _shown(url)
     try:
-        return read_stream(io.BytesIO(blob), source=url, archive_size=len(blob),
+        return read_stream(io.BytesIO(blob), source=named, archive_size=len(blob),
                            head_only=partial)
     except BinpkgError:
         # A short answer was the whole object, so the failure is the real one.
@@ -1434,12 +1603,12 @@ def fetch(url: str, *, timeout: float = PEER_TIMEOUT,
         if not partial:
             raise
     blob = _http_get(url, timeout=timeout, limit=cap)
-    return read_stream(io.BytesIO(blob), source=url, archive_size=len(blob))
+    return read_stream(io.BytesIO(blob), source=named, archive_size=len(blob))
 
 
 def _require_http(url: str) -> None:
     if not _is_url(url):
-        raise BinpkgError(f"{url}: only http:// and https:// peers are fetched")
+        raise BinpkgError(f"{_shown(url)}: only http:// and https:// peers are fetched")
 
 
 class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
@@ -1460,8 +1629,9 @@ class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         refuse = BinpkgError(
-            f"{req.full_url}: refused an HTTP {code} redirect to {newurl} — a peer does "
-            "not get to send this fetch to another host, scheme or port"
+            f"{_shown(req.full_url)}: refused an HTTP {code} redirect to "
+            f"{_shown(newurl)} — a peer does not get to send this fetch to another "
+            "host, scheme or port"
         )
         if urllib.parse.urlparse(newurl).scheme not in ("http", "https"):
             raise refuse
@@ -1478,7 +1648,7 @@ _OPENER = urllib.request.build_opener(_PinnedRedirect())
 def _origin(url: str) -> tuple[str, str, int]:
     parts = urllib.parse.urlparse(url)
     if parts.scheme not in ("http", "https"):
-        raise BinpkgError(f"{url}: only http:// and https:// are fetched")
+        raise BinpkgError(f"{_shown(url)}: only http:// and https:// are fetched")
     return parts.scheme, (parts.hostname or "").lower(), parts.port or (
         443 if parts.scheme == "https" else 80
     )
@@ -1493,9 +1663,10 @@ def _http_get(url: str, *, timeout: float, limit: int, first: int | None = None)
             blob = response.read(limit + 1)
     except urllib.error.HTTPError as exc:
         exc.close()  # it holds the response body open, and nothing here wants it
-        raise BinpkgError(f"{url}: HTTP {exc.code} {exc.reason}") from None
+        raise BinpkgError(f"{_shown(url)}: HTTP {exc.code} {exc.reason}") from None
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise BinpkgError(f"{url}: {exc}") from None
+        # `exc` can quote the URL back — urllib puts the request line in some OSErrors.
+        raise BinpkgError(f"{_shown(url)}: {_shown(str(exc))}") from None
     if first is not None:
         # Python's own http.server, and plenty of others, ignore Range and send
         # the whole object. Keeping the head and dropping the connection is the
@@ -1503,14 +1674,15 @@ def _http_get(url: str, *, timeout: float, limit: int, first: int | None = None)
         # what a package larger than the probe window would otherwise become.
         return blob[:first]
     if len(blob) > limit:
-        raise BinpkgError(f"{url}: larger than the {limit} byte fetch cap")
+        raise BinpkgError(f"{_shown(url)}: larger than the {limit} byte fetch cap")
     return blob
 
 
 # --- output -----------------------------------------------------------------
 
 
-_MARK = {EXACT: "exact", USABLE: "usable", MISMATCH: "mismatch", FOREIGN: "FOREIGN", ERROR: "ERROR"}
+_MARK = {EXACT: "exact", USABLE: "usable", REBUILD: "rebuild", MISMATCH: "mismatch",
+         FOREIGN: "FOREIGN", ERROR: "ERROR"}
 
 
 def render(fits: list[Fit]) -> list[str]:
@@ -1535,7 +1707,10 @@ def _provenance(fits: list[Fit]) -> list[str]:
     over plain http. So a verdict about a peer's package is a verdict about what
     that peer said. The Manifest check catches a mangled package, not a lying one.
     """
-    peers = sorted({urllib.parse.urlparse(item.source).netloc
+    # `netloc` carries the userinfo, so a token in the URL used to be printed here
+    # verbatim. Everything reaching a Fit is redacted already; splitting on the `@`
+    # makes this line unable to name a credential even if that ever stops being true.
+    peers = sorted({urllib.parse.urlparse(item.source).netloc.rpartition("@")[2]
                     for item in fits if _is_url(item.source)})
     if not peers:
         return []
@@ -1579,12 +1754,14 @@ def _detail(item: Fit) -> list[str]:
     head = f"{meta.cpv if meta else item.atom}  {_MARK.get(item.verdict, item.verdict)}"
     if item.contradictions:
         head += " but contradicted by its own ELFs"
-    lines = [f"{head}  {item.source or (meta.source if meta else '')}"]
+    lines = [f"{head}  {_shown(item.source or (meta.source if meta else ''))}"]
+    # Wide enough for the longest kind ("unconstrained") and for "undetermined", which
+    # has always overflowed an 8-wide column and pushed its own notes out of line.
     for reason in item.reasons:
         mark = "!!" if reason.kind == "link" else "  "
-        lines.append(f"{mark} {reason.kind:<8} {reason.text}")
+        lines.append(f"{mark} {reason.kind:<13} {reason.text}")
     for note in meta.unread if meta else ():
-        lines.append(f"   {'undetermined':<8} {note}")
+        lines.append(f"   {'undetermined':<13} {note}")
     return lines
 
 
@@ -1593,7 +1770,8 @@ def _summary(fits: list[Fit]) -> str:
     for item in fits:
         counts[item.verdict] = counts.get(item.verdict, 0) + 1
     links = sum(1 for item in fits if item.contradictions)
-    parts = [f"{counts[v]} {v}" for v in (EXACT, USABLE, MISMATCH, FOREIGN, ERROR) if v in counts]
+    parts = [f"{counts[v]} {v}"
+             for v in (EXACT, USABLE, REBUILD, MISMATCH, FOREIGN, ERROR) if v in counts]
     tail = f", {links} contradicting its own USE flags" if links else ""
     reusable = sum(1 for item in fits if item.ok)
     return f"{reusable}/{len(fits)} reusable on this machine: {', '.join(parts)}{tail}"

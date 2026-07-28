@@ -24,6 +24,12 @@ sub-agent's reply is summarised into bounded fields rather than spliced in.
 Every step — request, reply, tool call, spawn, escalation, verdict — is appended
 to `.aios/agent.jsonl`. That file is the point: a self-modifying machine whose
 changes cannot be audited afterwards is a machine you cannot trust.
+
+It is not the only writer: `aios.supervisor` appends its advisory lines there too,
+and `aios.dashboard` measures the machine's health from the same file. So each
+record names its author. That single field is what lets the reader tell work from
+commentary about work — without it a watcher's own writes read as the agent being
+alive, which is a monitor that cannot report the fault it is describing.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import llm, node, tools, welcome
+from . import dashboard, llm, node, tools, welcome
 
 LOG_PATH = ".aios/agent.jsonl"
 
@@ -906,7 +912,15 @@ class Agent:
         )
 
     def _record(self, kind: str, payload: dict) -> None:
-        record = {"ts": time.time(), "kind": kind, **payload}
+        # `author` written last, after the payload: it is what `dashboard` counts as
+        # the machine being alive, so no field of a record may be able to rename the
+        # writer of that record.
+        record = {
+            "ts": time.time(),
+            "kind": kind,
+            **payload,
+            "author": dashboard.AUTHOR_AGENT,
+        }
         path = self.log_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

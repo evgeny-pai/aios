@@ -38,6 +38,14 @@ error text — length buries the fix.
 | [updater-cannot-update-itself](updater-cannot-update-itself/SKILL.md) | The fix for the updater could only arrive via the updater it fixed |
 | [payload-list-is-a-deletion-list](payload-list-is-a-deletion-list/SKILL.md) | The update payload omitted the lockfile, so applying it would have deleted it |
 | [retry-only-transient-failures](retry-only-transient-failures/SKILL.md) | A retry wrapper re-ran a legitimate test-gate failure six times, burying the real error |
+| [iuse-defaults-decide-reuse](iuse-defaults-decide-reuse/SKILL.md) | `forge binpkg` said `exact` about the vim emerge refused for a "use flag configuration mismatch" |
+| [set-focus-is-not-a-lock](set-focus-is-not-a-lock/SKILL.md) | Announced a pod rebuild in the focus line, claimed nothing, and destroyed another session's machine |
+| [version-marker-outlived-its-artifact](version-marker-outlived-its-artifact/SKILL.md) | A version file on a volume claimed the newest release while the code had reverted to the image |
+| [monitor-writes-what-it-reads](monitor-writes-what-it-reads/SKILL.md) | The status bar said `ok` for eleven minutes because the supervisor kept journalling how stuck the agent was |
+| [k8s-service-env-collision](k8s-service-env-collision/SKILL.md) | A Service named `aios-repo` injected `AIOS_REPO_PORT=tcp://…` and the server died parsing its own Service's name |
+| [no-way-to-rebuild-the-ui](no-way-to-rebuild-the-ui/SKILL.md) | Closing two tmux panes stranded the session — the layout was built once and never repaired |
+| [verify-the-diagnosis-before-fixing](verify-the-diagnosis-before-fixing/SKILL.md) | Nearly documented a capability the agent already had, and whose briefing already named it |
+| [urllib-ignores-userinfo](urllib-ignores-userinfo/SKILL.md) | `http://x:token@127.0.0.1/` → `nodename nor servname provided` — and the token in the error |
 
 ## Adding one
 

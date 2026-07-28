@@ -30,8 +30,9 @@ if [ "$do_image" = yes ]; then
     step "checking the userland before building"
     # The image build runs this too, but failing here costs seconds instead of
     # minutes and gives a readable error instead of a buildkit trace.
-    python3 -m unittest discover -s tests -t . -q
-    python3 -m unittest aios.test_agent -q
+    # The same gate the image build and every release apply use, so "green here"
+    # and "green in the target" cannot mean different sets of suites.
+    python3 -m aios.update gate .
 
     step "building $IMAGE (linux/arm64)"
     docker build --platform linux/arm64 -f container/Dockerfile -t "$IMAGE" .
