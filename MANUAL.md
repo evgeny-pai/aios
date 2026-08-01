@@ -291,9 +291,43 @@ any text on its way out.
 python3 -m aios.buzz status              # the relay, this node's pubkey, who else is there
 python3 -m aios.buzz announce            # republish what this node can do
 python3 -m aios.buzz peers               # one line per node, with what it offers
-python3 -m aios.buzz ask 'who has a musl binpkg for vim 9.1?'
 python3 -m aios.buzz whoami              # the PUBLIC key, and this machine's name
 ```
+
+### Asking, and answering
+
+Nodes answer each other, and the shape of that is a deliberate security decision:
+
+**A responder never interprets free text.** An ask arrives from another machine, signed
+by a key this node has never met, and it arrives *asking for action* — strictly more
+dangerous than command output, which this project already wraps in an `<untrusted>`
+envelope. So a question carries its type in a **tag** from a closed set, and the
+responder matches on the tag, never on the prose. No model sees a peer's words.
+
+```bash
+python3 -m aios.buzz ask binpkg app-editors/vim   # structured: nodes answer this
+python3 -m aios.buzz ask 'why does musl hate my CFLAGS?'   # prose: humans only
+python3 -m aios.buzz asks                 # open questions, with their type
+python3 -m aios.buzz answers <event-id>   # what came back
+python3 -m aios.buzz respond              # answer what this node can, once
+python3 -m aios.buzz serve [interval]     # answer forever (boot runs this)
+```
+
+The types are `binpkg`, `distcc`, `tree`, `lock` and `capabilities`, and every one is
+answered by *measuring this node* — the binpkg index, the listening ports, the real
+lockfile digest. An ask with no recognised type is published and stays visible, and
+nothing automated replies to it.
+
+**Silence means no.** A node answers only when it can help. Answering "I don't have
+that" would put one event per node on the relay for every question asked, which buries
+the useful answers under N×M noise — the same reasoning as `capability`, where not
+claiming beats claiming nothing.
+
+Boot starts the responder in the background (`AIOS_BUZZ_RESPOND=0` opts out,
+`/var/log/aios-buzz.log`). It skips its own asks, answers each question once, and
+retries a refused answer rather than recording it as done. A peer's atom is validated
+against a strict pattern before it is used or echoed, and a peer's prose is never
+quoted back into an answer.
 
 `announce` runs at boot, after the repo server and `distccd`, and that order is
 load-bearing: **what a node announces is measured, never declared.**

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -442,11 +443,46 @@ class TestAuthHeader(unittest.TestCase):
         )
         self.assertNotIn("payload", {t[0] for t in header["tags"]})
 
-    def test_each_header_is_distinct_so_replay_protection_cannot_bite(self):
-        """The relay records each auth event id and refuses a repeat within its TTL."""
-        first = buzz.auth_header("POST", "http://r:3000", "/events", b"{}", key=KEY)
-        second = buzz.auth_header("POST", "http://r:3000", "/events", b"{}", key=KEY)
-        self.assertNotEqual(first, second)
+    def test_two_identical_requests_in_one_second_get_different_event_ids(self):
+        """The relay records each auth event ID and refuses a repeat within its TTL.
+
+        This test previously compared the header STRINGS and passed while the bug was
+        live: `sign` uses random aux_rand, so two auth events for the same request
+        differ in `sig` and share an `id` — and the id is what the replay guard keys
+        on. A polling responder hit `401 NIP-98: replay detected` in production. The
+        fixed-timestamp argument here is the whole point; without it the clock hides
+        the collision most of the time.
+        """
+        ids = {
+            json.loads(
+                base64.b64decode(
+                    buzz.auth_header("POST", "http://r:3000", "/events", b"{}",
+                                     key=KEY, created_at=1700000000)[len("Nostr "):]
+                )
+            )["id"]
+            for _ in range(25)
+        }
+        self.assertEqual(len(ids), 25, "same second, same request — ids must still differ")
+
+    def test_the_nonce_is_what_makes_them_differ(self):
+        header = self.header_event(
+            buzz.auth_header("POST", "http://r:3000", "/events", b"{}", key=KEY,
+                             created_at=1700000000)
+        )
+        nonces = {t[1] for t in header["tags"] if t[0] == "nonce"}
+        self.assertEqual(len(nonces), 1)
+        self.assertGreaterEqual(len(nonces.pop()), 16, "a nonce short enough to collide is not one")
+
+    def test_the_nonce_does_not_disturb_the_tags_the_relay_checks(self):
+        header = self.header_event(
+            buzz.auth_header("PUT", "http://r:3000", "/media/upload", b"xyz", key=KEY,
+                             created_at=1700000000)
+        )
+        tags = {t[0]: t[1] for t in header["tags"]}
+        self.assertEqual(tags["u"], "http://r:3000/media/upload")
+        self.assertEqual(tags["method"], "PUT")
+        self.assertEqual(tags["payload"], hashlib.sha256(b"xyz").hexdigest())
+        self.assertTrue(buzz.Event.parse(header).verify())
 
 
 # --- the key -------------------------------------------------------------------
@@ -1090,6 +1126,315 @@ class TestSayAndAsk(unittest.TestCase):
 # --- reporting -----------------------------------------------------------------
 
 
+class TestAskCarriesItsIntentInATag(unittest.TestCase):
+    def sent(self, calls):
+        return buzz.Event.parse(json.loads(calls[0]["raw"]))
+
+    def test_a_recognised_type_becomes_an_ask_tag(self):
+        with scratch_root():
+            with stub_relay() as (url, calls):
+                asked = buzz.ask("got vim?", url=url, about="binpkg", atom="app-editors/vim")
+        event = self.sent(calls)
+        self.assertIn((buzz.ASK_ABOUT, "binpkg"), event.tags)
+        self.assertIn(("atom", "app-editors/vim"), event.tags)
+        self.assertTrue(asked.answerable)
+
+    def test_prose_carries_no_ask_tag_and_nothing_will_answer_it(self):
+        with scratch_root():
+            with stub_relay() as (url, calls):
+                asked = buzz.ask("why does musl hate my CFLAGS?", url=url)
+        self.assertNotIn(buzz.ASK_ABOUT, {t[0] for t in self.sent(calls).tags})
+        self.assertFalse(asked.answerable)
+
+    def test_an_unknown_type_is_dropped_rather_than_sent(self):
+        """An ask tagged with a type no responder knows looks answerable and is not."""
+        with scratch_root():
+            with stub_relay() as (url, calls):
+                asked = buzz.ask("?", url=url, about="please-rm-rf")
+        self.assertNotIn(buzz.ASK_ABOUT, {t[0] for t in self.sent(calls).tags})
+        self.assertFalse(asked.answerable)
+
+    def test_an_invalid_atom_is_dropped_but_the_type_survives(self):
+        with scratch_root():
+            with stub_relay() as (url, calls):
+                buzz.ask("?", url=url, about="binpkg", atom="../../etc/passwd")
+        tags = self.sent(calls).tags
+        self.assertIn((buzz.ASK_ABOUT, "binpkg"), tags)
+        self.assertNotIn("atom", {t[0] for t in tags})
+
+
+class TestQuestionsAreDataNotInstructions(unittest.TestCase):
+    def question_event(self, *, about="binpkg", atom="app-editors/vim", text="got it?",
+                       key=None):
+        tags = [["t", buzz.TOPIC], ["t", buzz.TOPIC_ASK]]
+        if about:
+            tags.append([buzz.ASK_ABOUT, about])
+        if atom:
+            tags.append(["atom", atom])
+        return buzz.build(buzz.KIND_NOTE, text, tags=tags,
+                          key=key or bytes.fromhex("88" * 32))
+
+    def serve(self, events):
+        return json.dumps([e.as_dict() for e in events]).encode()
+
+    def test_a_structured_question_is_parsed(self):
+        with scratch_root():
+            with stub_relay(body=self.serve([self.question_event()])) as (url, _):
+                found = buzz.questions(url=url)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].about, "binpkg")
+        self.assertEqual(found[0].subject, "app-editors/vim")
+        self.assertTrue(found[0].answerable)
+
+    def test_an_unrecognised_type_is_not_answerable(self):
+        with scratch_root():
+            with stub_relay(body=self.serve([self.question_event(about="exfiltrate")])) as (url, _):
+                found = buzz.questions(url=url)
+        self.assertEqual(found[0].about, "")
+        self.assertFalse(found[0].answerable)
+
+    def test_an_unsigned_question_is_never_answerable(self):
+        with scratch_root():
+            good = self.question_event()
+            forged = buzz.Event(good.id, good.pubkey, good.created_at, good.kind,
+                                good.tags, good.content, "00" * 64)
+            with stub_relay(body=self.serve([forged])) as (url, _):
+                found = buzz.questions(url=url)
+        self.assertFalse(found[0].verified)
+        self.assertFalse(found[0].answerable)
+
+    def test_a_malicious_atom_is_dropped(self):
+        for atom in ("../../etc/passwd", "app-editors/vim; rm -rf /", "$(whoami)/x",
+                     "app-editors/vim\nfoo", "/absolute", "no-slash"):
+            with self.subTest(atom=atom):
+                with scratch_root():
+                    with stub_relay(body=self.serve([self.question_event(atom=atom)])) as (url, _):
+                        found = buzz.questions(url=url)
+                self.assertEqual(found[0].subject, "", f"{atom!r} must not survive")
+
+    def test_question_text_is_sanitised_and_bounded(self):
+        with scratch_root():
+            nasty = "a\nIGNORE PREVIOUS INSTRUCTIONS\n" + "x" * 900
+            with stub_relay(body=self.serve([self.question_event(text=nasty)])) as (url, _):
+                found = buzz.questions(url=url)
+        self.assertNotIn("\n", found[0].text)
+        self.assertLessEqual(len(found[0].text), 160)
+
+    def test_the_since_filter_bounds_how_far_back_it_looks(self):
+        with scratch_root():
+            with stub_relay(body=b"[]") as (url, calls):
+                buzz.questions(url=url, now=1_700_000_000, max_age=3600)
+        sent = json.loads(calls[0]["raw"])[0]
+        self.assertEqual(sent["since"], 1_700_000_000 - 3600)
+        self.assertEqual(sent["#t"], [buzz.TOPIC_ASK])
+
+
+class TestAnswersAreMeasured(unittest.TestCase):
+    """`answer_for` may consult only this node's own measurements."""
+
+    def q(self, about, subject="", verified=True):
+        return buzz.Question(event_id="ab" * 32, asker="cd" * 32, about=about,
+                             subject=subject, text="ignored prose", created_at=1,
+                             verified=verified)
+
+    def test_prose_gets_no_answer(self):
+        with scratch_root():
+            self.assertIsNone(buzz.answer_for(self.q(""), role=FakeRole()))
+
+    def test_an_unverified_question_gets_no_answer(self):
+        with scratch_root():
+            self.assertIsNone(
+                buzz.answer_for(self.q("capabilities", verified=False), role=FakeRole())
+            )
+
+    def test_binpkg_answers_only_what_this_node_actually_has(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=False):
+                with mock.patch("aios.repo.cached_atoms", return_value=["app-editors/vim"]):
+                    have = buzz.answer_for(self.q("binpkg", "app-editors/vim"), role=FakeRole())
+                    havent = buzz.answer_for(self.q("binpkg", "app-misc/tmux"), role=FakeRole())
+        self.assertIsNotNone(have)
+        self.assertIn("app-editors/vim", have.text)
+        self.assertIn(["have", "yes"], have.tags)
+        self.assertIsNone(havent, "silence means no; answering 'no' is N×M noise")
+
+    def test_binpkg_with_no_valid_atom_is_not_a_question(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=False):
+                self.assertIsNone(buzz.answer_for(self.q("binpkg", ""), role=FakeRole()))
+
+    def test_distcc_is_answered_only_when_a_daemon_answers(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=True):
+                self.assertIsNotNone(buzz.answer_for(self.q("distcc"), role=FakeRole()))
+            with mock.patch("aios.buzz._listening", return_value=False):
+                self.assertIsNone(buzz.answer_for(self.q("distcc"), role=FakeRole()))
+
+    def test_tree_is_answered_only_by_a_node_holding_one(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=False):
+                self.assertIsNotNone(buzz.answer_for(self.q("tree"), role=FakeRole()))
+                self.assertIsNone(
+                    buzz.answer_for(self.q("tree"),
+                                    role=FakeRole(tree=False, tree_detail="", serving=False))
+                )
+
+    def test_lock_is_answered_only_by_a_node_that_knows_its_own_digest(self):
+        with scratch_root() as root:
+            with mock.patch("aios.buzz._listening", return_value=False):
+                self.assertIsNone(buzz.answer_for(self.q("lock"), role=FakeRole()),
+                                  "no lockfile, nothing to say")
+                (root / "aios.lock.json").write_text(
+                    json.dumps({"digest": "sha256:abc"}), encoding="utf-8"
+                )
+                reply = buzz.answer_for(self.q("lock"), role=FakeRole())
+        self.assertIsNotNone(reply)
+        self.assertIn("sha256:abc", reply.text)
+
+    def test_every_answer_threads_back_to_its_question(self):
+        with scratch_root() as root:
+            # A node able to answer every question type: a lockfile it knows, a tree it
+            # serves, a binpkg it holds, and a distccd that answers.
+            (root / "aios.lock.json").write_text(
+                json.dumps({"digest": "sha256:abc"}), encoding="utf-8"
+            )
+            with mock.patch("aios.buzz._listening", return_value=True):
+                for about in buzz.QUESTIONS:
+                    subject = "app-editors/vim" if about == "binpkg" else ""
+                    with mock.patch("aios.repo.cached_atoms", return_value=["app-editors/vim"]):
+                        reply = buzz.answer_for(self.q(about, subject), role=FakeRole())
+                    with self.subTest(about=about):
+                        self.assertIsNotNone(reply, f"{about} must be answerable by a full node")
+                        tags = {t[0] for t in reply.tags}
+                        self.assertIn("e", tags)   # NIP-10: which question
+                        self.assertIn("p", tags)   # who asked
+                        self.assertIn(buzz.ANSWER_ABOUT, tags)
+                        self.assertIn(("t", buzz.TOPIC_ANSWER), [tuple(t) for t in reply.tags])
+
+    def test_the_answer_never_quotes_the_question_text(self):
+        """The prose is untrusted; echoing it would put it in another node's output."""
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=True):
+                reply = buzz.answer_for(self.q("capabilities"), role=FakeRole())
+        self.assertNotIn("ignored prose", reply.text)
+
+
+class TestRespond(unittest.TestCase):
+    def ask_event(self, *, about="distcc", key=None, text="?"):
+        tags = [["t", buzz.TOPIC], ["t", buzz.TOPIC_ASK], [buzz.ASK_ABOUT, about]]
+        return buzz.build(buzz.KIND_NOTE, text, tags=tags,
+                          key=key or bytes.fromhex("99" * 32))
+
+    def serve(self, events):
+        return json.dumps([e.as_dict() for e in events]).encode()
+
+    def test_answers_a_peers_question(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=True):
+                with stub_relay(scripted=[(200, self.serve([self.ask_event()])),
+                                          (200, b'{"accepted":true}')]) as (url, calls):
+                    done = buzz.respond(url=url, role=FakeRole())
+        self.assertEqual(len(done), 1)
+        self.assertTrue(done[0].published)
+        answer = buzz.Event.parse(json.loads(calls[1]["raw"]))
+        self.assertTrue(answer.verify())
+
+    def test_never_answers_its_own_ask(self):
+        with scratch_root():
+            mine = self.ask_event(key=buzz.seckey())
+            with mock.patch("aios.buzz._listening", return_value=True):
+                with stub_relay(body=self.serve([mine])) as (url, calls):
+                    done = buzz.respond(url=url, role=FakeRole())
+        self.assertEqual(done, [])
+        self.assertEqual(len(calls), 1, "the query, and no answer")
+
+    def test_does_not_answer_the_same_question_twice(self):
+        with scratch_root():
+            event = self.ask_event()
+            with mock.patch("aios.buzz._listening", return_value=True):
+                with stub_relay(body=self.serve([event])) as (url, _):
+                    first = buzz.respond(url=url, role=FakeRole())
+                with stub_relay(body=self.serve([event])) as (url, calls):
+                    second = buzz.respond(url=url, role=FakeRole())
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [], "already answered")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_refused_answer_is_retried_rather_than_forgotten(self):
+        """Recording a failure as answered would lose the question permanently."""
+        with scratch_root() as root:
+            event = self.ask_event()
+            with mock.patch("aios.buzz._listening", return_value=True):
+                with stub_relay(scripted=[(200, self.serve([event])),
+                                          (500, b'{"error":"relay exploded"}')]) as (url, _):
+                    done = buzz.respond(url=url, role=FakeRole())
+            self.assertEqual(len(done), 1)
+            self.assertFalse(done[0].published)
+            self.assertNotIn(event.id, buzz.answered(root))
+
+    def test_stays_quiet_when_it_cannot_help(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=False):
+                with stub_relay(body=self.serve([self.ask_event(about="distcc")])) as (url, calls):
+                    self.assertEqual(buzz.respond(url=url, role=FakeRole()), [])
+            self.assertEqual(len(calls), 1)
+
+    def test_honours_its_per_pass_cap(self):
+        with scratch_root():
+            events = [self.ask_event(key=bytes.fromhex(f"{i:02x}" * 32)) for i in range(1, 12)]
+            with mock.patch("aios.buzz._listening", return_value=True):
+                with stub_relay(body=self.serve(events)) as (url, _):
+                    done = buzz.respond(url=url, role=FakeRole(), limit=3)
+        self.assertEqual(len(done), 3)
+
+    def test_answered_set_is_bounded(self):
+        with scratch_root() as root:
+            buzz._remember_answered([f"{i:064x}" for i in range(buzz.ANSWERED_KEEP + 500)], root)
+            self.assertLessEqual(len(buzz.answered(root)), buzz.ANSWERED_KEEP)
+
+    def test_an_unwritable_state_dir_does_not_stop_answering(self):
+        with scratch_root():
+            with mock.patch("aios.buzz._listening", return_value=True):
+                with mock.patch("pathlib.Path.write_text", side_effect=OSError("read-only")):
+                    with stub_relay(scripted=[(200, self.serve([self.ask_event()])),
+                                              (200, b"{}")]) as (url, _):
+                        done = buzz.respond(url=url, role=FakeRole())
+        self.assertEqual(len(done), 1)
+        self.assertTrue(done[0].published)
+
+
+class TestAnswersTo(unittest.TestCase):
+    def answer_event(self, ask_id, *, key=None, tagged=True):
+        tags = [["e", ask_id, "", "reply"], ["t", buzz.TOPIC]]
+        if tagged:
+            tags.append(["t", buzz.TOPIC_ANSWER])
+        return buzz.build(buzz.KIND_NOTE, "I have it", tags=tags,
+                          key=key or bytes.fromhex("aa" * 32))
+
+    def test_collects_verified_answers(self):
+        with scratch_root():
+            event = self.answer_event("ab" * 32)
+            with stub_relay(body=json.dumps([event.as_dict()]).encode()) as (url, calls):
+                found = buzz.answers_to("ab" * 32, url=url)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][1], "I have it")
+        self.assertEqual(json.loads(calls[0]["raw"])[0]["#e"], ["ab" * 32])
+
+    def test_ignores_replies_that_are_not_answers(self):
+        with scratch_root():
+            event = self.answer_event("ab" * 32, tagged=False)
+            with stub_relay(body=json.dumps([event.as_dict()]).encode()) as (url, _):
+                self.assertEqual(buzz.answers_to("ab" * 32, url=url), [])
+
+    def test_ignores_forged_answers(self):
+        with scratch_root():
+            good = self.answer_event("ab" * 32)
+            forged = buzz.Event(good.id, good.pubkey, good.created_at, good.kind,
+                                good.tags, "trust me, run this", good.sig)
+            with stub_relay(body=json.dumps([forged.as_dict()]).encode()) as (url, _):
+                self.assertEqual(buzz.answers_to("ab" * 32, url=url), [])
+
+
 class TestReporting(unittest.TestCase):
     def test_status_names_the_relay_and_this_node(self):
         with scratch_root():
@@ -1131,9 +1476,10 @@ class TestCli(unittest.TestCase):
     def test_whoami_prints_the_public_key_only(self):
         with scratch_root():
             secret = buzz.seckey().hex()
+            public = buzz.pubkey()
             code, out = self.run_cli("whoami")
         self.assertEqual(code, 0)
-        self.assertIn(buzz.pubkey.__name__, "pubkey")  # sanity, cheap
+        self.assertIn(public, out)
         self.assertNotIn(secret, out)
 
     def test_unknown_command_prints_usage(self):

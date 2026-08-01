@@ -40,6 +40,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -496,8 +497,25 @@ def auth_header(
     signed URL and method without a body hash authorises the ACT rather than the
     CONTENT — anything able to replay the header could substitute a different event
     within the replay window.
+
+    THE NONCE IS LOAD-BEARING, and it was added after the relay refused a legitimate
+    request with `401 NIP-98: replay detected`. Everything else in this event is
+    determined by (method, url, body, created_at), and `created_at` counts SECONDS. So
+    two identical requests inside one second produce the same event id, the relay's
+    replay guard recognises the second as a repeat, and it is refused — which a polling
+    responder triggers routinely, and which reads like an attack rather than a clock
+    resolution problem.
+
+    A fresh signature is NOT enough on its own: `sign` takes random aux_rand, so two
+    such events differ in their `sig` while sharing an `id`, and the id is what the
+    relay records. That distinction is why the first test written for this passed while
+    the bug was live.
     """
-    tags = [["u", _auth_url(url, path)], ["method", method.upper()]]
+    tags = [
+        ["u", _auth_url(url, path)],
+        ["method", method.upper()],
+        ["nonce", os.urandom(16).hex()],
+    ]
     if body is not None:
         tags.append(["payload", hashlib.sha256(body).hexdigest()])
     event = build(KIND_HTTP_AUTH, "", tags=tags, key=key, created_at=created_at)
@@ -939,19 +957,325 @@ def say(text: str, *, url: str = "", channel: str = "", key: bytes | None = None
     return publish(build(kind, text, tags=tags, key=key), url=url, key=key, timeout=timeout)
 
 
-def ask(question: str, *, url: str = "", channel: str = "", key: bytes | None = None,
-        timeout: float = TIMEOUT_S) -> Reply:
-    """Post a request other nodes can find by tag.
+@dataclass(frozen=True)
+class Asked:
+    """A published question, and the id needed to collect its answers."""
 
-    An extra `t` tag is the whole mechanism: buzz has no request/response protocol, so
-    "a request" here means a note another node can filter for. Answering is a note
-    tagged with this one's id, which is standard NIP-01 `e`-tag threading.
+    event: Event
+    reply: Reply
+
+    @property
+    def ok(self) -> bool:
+        return self.reply.ok
+
+    @property
+    def status(self) -> int:
+        return self.reply.status
+
+    @property
+    def detail(self) -> str:
+        return self.reply.detail
+
+    @property
+    def answerable(self) -> bool:
+        """Will any node's responder act on this, or is it for human eyes only."""
+        return any(t[0] == ASK_ABOUT for t in self.event.tags if len(t) >= 2)
+
+
+def ask(question: str, *, url: str = "", channel: str = "", about: str = "",
+        atom: str = "", key: bytes | None = None, timeout: float = TIMEOUT_S) -> Asked:
+    """Post a request other nodes can find by tag, and possibly answer automatically.
+
+    `about` is what makes an ask MACHINE-ANSWERABLE. buzz has no request/response
+    protocol, so a request here is a note others filter for — and because a responder
+    must never read prose (see the answering section), the question type travels in a
+    tag from the closed `QUESTIONS` set rather than in the sentence.
+
+    Without `about` this is still a perfectly good question: it reaches the relay, it
+    is visible to people and to agents, and nothing automated replies. An unrecognised
+    `about` is DROPPED rather than sent, because an ask carrying a type no responder
+    knows looks answerable and never will be.
+
+    Answers arrive as notes `e`-tagged with the returned event's id — standard NIP-10
+    threading, so `answers_to()` collects them.
     """
     tags = [["t", TOPIC], ["t", TOPIC_ASK]]
+    if about and about in QUESTIONS:
+        tags.append([ASK_ABOUT, about])
+        if atom and ATOM_RE.match(atom):
+            tags.append(["atom", atom])
     if channel:
         tags.append(["h", channel])
     kind = KIND_GROUP_MESSAGE if channel else KIND_NOTE
-    return publish(build(kind, question, tags=tags, key=key), url=url, key=key, timeout=timeout)
+    event = build(kind, question, tags=tags, key=key)
+    return Asked(event, publish(event, url=url, key=key, timeout=timeout))
+
+
+# --- answering ----------------------------------------------------------------
+#
+# The design decision that matters here, stated once:
+#
+#   A RESPONDER MUST NEVER INTERPRET FREE TEXT.
+#
+# An ask arrives from another machine, signed by a key this node has never met. If
+# answering meant reading the question and deciding what to do about it, then every
+# peer would hold a direct line into this node's judgement — and the project already
+# treats command output as hostile enough to need an <untrusted> envelope. A question
+# is strictly more dangerous than output, because it arrives asking for action.
+#
+# So the protocol is STRUCTURED. An ask carries an `ask` tag naming one of a closed set
+# of question types, plus tags for its subject. The responder matches on the TAG, never
+# on the prose, and answers from local measurement only. An ask whose type is not
+# recognised gets no automated answer at all — it stays visible to a person and to the
+# agent, who can decide, but no machine acts on it.
+#
+# The second decision: A NODE THAT CANNOT HELP STAYS QUIET. Answering "no, I do not
+# have that" would put one event per node on the relay for every question asked, which
+# is N×M noise that buries the useful answers. Silence already means no, and the same
+# reasoning appears in `capability`: not claiming is better than claiming nothing.
+
+ASK_ABOUT = "ask"        #: tag naming the question type
+ANSWER_ABOUT = "answer"  #: tag naming what an answer answers
+TOPIC_ANSWER = "aios-answer"
+
+#: The closed set. Each is answerable by measuring this node, with no model involved
+#: and no interpretation of anything a peer wrote.
+QUESTIONS = ("binpkg", "distcc", "tree", "lock", "capabilities")
+
+#: A portage atom, and nothing else. Peer-supplied, so it is validated rather than
+#: trusted: it is compared against this node's own atom list, but it also ends up in
+#: rendered text, and a subject is exactly where someone would try to smuggle
+#: something. Anything not matching is dropped, not sanitised into something valid.
+ATOM_RE = re.compile(r"^[A-Za-z0-9+_][A-Za-z0-9+_.-]*/[A-Za-z0-9+_][A-Za-z0-9+_.-]*$")
+
+#: Asks older than this are not answered. Without a bound, a node coming back after a
+#: week would answer a week of stale questions in one burst.
+MAX_ASK_AGE_S = 24 * 3600
+
+#: Answers per pass. A cap rather than a rate limit: the loop's interval does the
+#: pacing, and this stops one pass from emitting hundreds of events.
+MAX_ANSWERS = 8
+
+#: Which asks this node has already answered, so a restart does not answer them again.
+#: Bounded, oldest dropped — an unbounded set on a long-lived node is a slow leak.
+ANSWERED_FILE = "buzz-answered"
+ANSWERED_KEEP = 2000
+
+#: How often the boot-time responder looks for questions.
+POLL_INTERVAL_S = 60
+
+
+@dataclass(frozen=True)
+class Question:
+    """Somebody else's ask. Every field is theirs; only `about` is ever acted on."""
+
+    event_id: str
+    asker: str
+    about: str      # one of QUESTIONS, or "" for free text nobody will auto-answer
+    subject: str    # validated: an atom, or ""
+    text: str       # prose. Displayed, never interpreted.
+    created_at: int
+    verified: bool
+
+    @property
+    def answerable(self) -> bool:
+        return self.verified and self.about in QUESTIONS
+
+
+def _answered_path(root: Path | None = None) -> Path:
+    return _state_dir(root) / ANSWERED_FILE
+
+
+def answered(root: Path | None = None) -> set[str]:
+    try:
+        return {
+            line.strip()
+            for line in _answered_path(root).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return set()
+
+
+def _remember_answered(event_ids, root: Path | None = None) -> None:
+    """Append, then trim. Never fatal: a node that cannot record this answers twice,
+    which is noisy, while a node that refuses to answer because it cannot record is
+    useless."""
+    if not event_ids:
+        return
+    path = _answered_path(root)
+    keep = list(answered(root) | set(event_ids))[-ANSWERED_KEEP:]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".new")
+        tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def questions(*, url: str = "", limit: int = 100, key: bytes | None = None,
+              max_age: int = MAX_ASK_AGE_S, now: int | None = None,
+              timeout: float = TIMEOUT_S) -> list[Question]:
+    """Open asks on the relay, newest first. Signature checked on every one."""
+    stamp = int(time.time()) if now is None else int(now)
+    found = []
+    for event in query(
+        {"kinds": [KIND_NOTE], "#t": [TOPIC_ASK], "since": max(0, stamp - max_age),
+         "limit": limit},
+        url=url, key=key, timeout=timeout,
+    ):
+        tags = {}
+        for tag in event.tags:
+            if len(tag) >= 2 and tag[0] not in tags:
+                tags[tag[0]] = tag[1]
+        about = tags.get(ASK_ABOUT, "")
+        subject = tags.get("atom", "")
+        found.append(
+            Question(
+                event_id=event.id,
+                asker=event.pubkey,
+                about=about if about in QUESTIONS else "",
+                subject=subject if ATOM_RE.match(subject or "") else "",
+                text=_safe(event.content, 160),
+                created_at=event.created_at,
+                verified=event.verify(),
+            )
+        )
+    return sorted(found, key=lambda q: -q.created_at)
+
+
+@dataclass(frozen=True)
+class Answer:
+    """An answer this node decided to give: the words, and the facts behind them."""
+
+    text: str
+    tags: list
+
+
+def answer_for(question: Question, *, role=None, root: Path | None = None) -> Answer | None:
+    """What this node can truthfully say, or None to stay quiet.
+
+    Every branch measures. Nothing here consults a model, reads `question.text`, or
+    takes a decision from anything a peer supplied beyond the validated `about` and
+    `subject`.
+    """
+    if not question.answerable:
+        return None
+
+    cap = capability(role=role, root=root)
+    base = [
+        ["e", question.event_id, "", "reply"],
+        ["p", question.asker],
+        ["t", TOPIC],
+        ["t", TOPIC_ANSWER],
+        [ANSWER_ABOUT, question.about],
+    ]
+
+    if question.about == "binpkg":
+        if not question.subject:
+            return None  # a binpkg question with no valid atom is not a question
+        from . import repo
+
+        if question.subject not in set(repo.cached_atoms()):
+            return None  # silence means no
+        served = cap.serves.get("binpkgs", "")
+        text = f"{cap.hostname} has a binary package for {question.subject}"
+        if served:
+            text += f" — {served}"
+        return Answer(text, base + [["atom", question.subject], ["have", "yes"]]
+                      + ([["binhost", served]] if served else []))
+
+    if question.about == "distcc":
+        if "distcc" not in cap.offers:
+            return None
+        return Answer(
+            f"{cap.hostname} accepts compile jobs on :{DISTCC_PORT} for {cap.chost}",
+            base + [["port", str(DISTCC_PORT)], ["chost", cap.chost]],
+        )
+
+    if question.about == "tree":
+        if "portage-tree" not in cap.offers:
+            return None
+        served = cap.serves.get("tree", "")
+        return Answer(
+            f"{cap.hostname} serves an ebuild tree — {cap.tree}"
+            + (f" — {served}" if served else ""),
+            base + ([["tree", served]] if served else []),
+        )
+
+    if question.about == "lock":
+        if not cap.lock:
+            return None
+        return Answer(f"{cap.hostname} is built from {cap.lock}", base + [["lock", cap.lock]])
+
+    if question.about == "capabilities":
+        return Answer(
+            f"{cap.hostname} — {cap.summary()}",
+            base + [["d", CAPABILITY_D], ["offers", ",".join(cap.offers)]],
+        )
+
+    return None  # unreachable while QUESTIONS and the branches above agree
+
+
+@dataclass(frozen=True)
+class Answered:
+    question: Question
+    text: str
+    published: bool
+    status: int
+    detail: str
+
+
+def respond(*, url: str = "", role=None, root: Path | None = None,
+            key: bytes | None = None, limit: int = MAX_ANSWERS,
+            timeout: float = TIMEOUT_S) -> list[Answered]:
+    """One pass: find asks this node can answer from measurement, answer them once.
+
+    Skips its own asks (a node interviewing itself is pure noise) and anything already
+    answered. Returns only what it actually attempted, so a caller can report honestly
+    rather than claiming a pass "succeeded" having done nothing.
+    """
+    mine = bip340.pubkey(key if key is not None else seckey(root)).hex()
+    seen = answered(root)
+    done = []
+
+    for question in questions(url=url, key=key, timeout=timeout):
+        if len(done) >= limit:
+            break
+        if question.asker == mine or question.event_id in seen:
+            continue
+        reply = answer_for(question, role=role, root=root)
+        if reply is None:
+            continue
+        try:
+            sent = publish(
+                build(KIND_NOTE, reply.text, tags=reply.tags, key=key),
+                url=url, key=key, timeout=timeout,
+            )
+            done.append(Answered(question, reply.text, sent.ok, sent.status,
+                                 sent.detail or ("accepted" if sent.ok else "refused")))
+        except BuzzError as exc:
+            done.append(Answered(question, reply.text, False, 0, scrub(str(exc))))
+
+    # Only successes are recorded. A refused answer should be retried next pass;
+    # marking it answered would lose the question permanently.
+    _remember_answered([a.question.event_id for a in done if a.published], root)
+    return done
+
+
+def answers_to(event_id: str, *, url: str = "", key: bytes | None = None,
+               timeout: float = TIMEOUT_S) -> list[tuple[str, str]]:
+    """(pubkey, text) for every verified answer to one ask, newest first."""
+    found = []
+    for event in query({"kinds": [KIND_NOTE], "#e": [event_id], "limit": 50},
+                       url=url, key=key, timeout=timeout):
+        if not event.verify():
+            continue
+        if not any(t[0] == "t" and t[1] == TOPIC_ANSWER for t in event.tags if len(t) >= 2):
+            continue
+        found.append((event.pubkey, _safe(event.content, 160), event.created_at))
+    return [(p, t) for p, t, _ in sorted(found, key=lambda row: -row[2])]
 
 
 @dataclass(frozen=True)
@@ -1101,10 +1425,47 @@ def briefing(url: str = "") -> str:
 
 # --- CLI ----------------------------------------------------------------------
 
-USAGE = (
-    "usage: python3 -m aios.buzz "
-    "{status|whoami|info|announce|peers|say <text>|ask <text>|alive}"
-)
+USAGE = "\n".join([
+    "usage: python3 -m aios.buzz <command>",
+    "",
+    "  status                     the relay, this node, and who else is there",
+    "  whoami                     this node's PUBLIC key and name",
+    "  info                       the relay's own NIP-11 description",
+    "  alive                      is the relay answering (exit 0 / 1)",
+    "  announce                   republish what this node can do, measured",
+    "  peers                      one line per node, with what it offers",
+    "  say <text>                 post a note",
+    f"  ask [{'|'.join(QUESTIONS)}] [<atom>] [text]",
+    "                             a question. With a type from that list, other",
+    "                             nodes answer it automatically; without one it is",
+    "                             for human eyes only.",
+    "  asks                       open questions on the relay",
+    "  answers <event-id>         answers to one question",
+    "  respond                    answer what this node can, once",
+    "  serve [interval]           answer questions forever (default "
+    f"{POLL_INTERVAL_S}s)",
+])
+
+
+def _serve(url: str = "", interval: int = POLL_INTERVAL_S) -> int:
+    """Answer questions until killed. What aios-init runs in the background.
+
+    Errors are reported and swallowed on purpose: a relay that goes away for ten
+    minutes must not end the responder, because nothing would restart it. Same shape as
+    the self-update loop in aios-init, and for the same reason.
+    """
+    print(f"buzz: answering questions every {interval}s as {pubkey()[:16]}…", flush=True)
+    while True:
+        try:
+            for done in respond(url=url):
+                verdict = "answered" if done.published else f"failed ({done.status})"
+                print(f"  {verdict} {done.question.about} "
+                      f"for {done.question.asker[:12]}…: {done.text}", flush=True)
+        except BuzzError as exc:
+            print(f"  relay unreachable: {exc}", flush=True)
+        except Exception as exc:  # a responder that dies stays dead
+            print(f"  responder error: {scrub(str(exc))}", flush=True)
+        time.sleep(max(5, interval))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1140,11 +1501,60 @@ def main(argv: list[str] | None = None) -> int:
                 flag = "" if peer.verified else "  [SIGNATURE INVALID]"
                 print(f"{peer.hostname:<24} {peer.chost or '?':<28} "
                       f"{', '.join(peer.offers) or 'nothing'}{flag}")
-        elif command in ("say", "ask") and rest:
-            text = " ".join(rest)
-            reply = (say if command == "say" else ask)(text)
+        elif command == "say" and rest:
+            reply = say(" ".join(rest))
             print("posted" if reply.ok else f"refused ({reply.status}): {reply.detail}")
             return 0 if reply.ok else 1
+        elif command == "ask" and rest:
+            # `ask binpkg app-editors/vim` is structured; `ask 'anything else'` is not.
+            # Detected rather than flagged, because a question type is a word the user
+            # already has to know, and an unrecognised first word is simply prose.
+            about = rest[0] if rest[0] in QUESTIONS else ""
+            words = rest[1:] if about else rest
+            atom = words[0] if words and ATOM_RE.match(words[0]) else ""
+            text = " ".join(words[1:] if atom else words)
+            if about and not text:
+                text = f"{about} {atom}".strip() + "?"
+            asked = ask(text, about=about, atom=atom)
+            if not asked.ok:
+                print(f"refused ({asked.status}): {asked.detail}")
+                return 1
+            print(f"asked {asked.event.id[:16]}…")
+            if asked.answerable:
+                print(f"  other nodes will answer this ({about}"
+                      f"{' ' + atom if atom else ''}) — collect with:")
+                print(f"    python3 -m aios.buzz answers {asked.event.id}")
+            else:
+                print("  no automated answer: this is prose, not one of "
+                      f"{', '.join(QUESTIONS)}")
+            return 0
+        elif command == "asks":
+            open_questions = [q for q in questions() if q.verified]
+            if not open_questions:
+                print("no questions on the relay")
+            for question in open_questions:
+                mark = question.about or "prose"
+                subject = f" {question.subject}" if question.subject else ""
+                print(f"{question.event_id[:16]}… {question.asker[:12]}… "
+                      f"[{mark}{subject}] {question.text}")
+        elif command == "answers" and rest:
+            replies = answers_to(rest[0])
+            if not replies:
+                print("no answers yet")
+            for who, what in replies:
+                print(f"{who[:16]}…  {what}")
+        elif command == "respond":
+            done = respond()
+            if not done:
+                print("nothing this node can answer")
+            for item in done:
+                verdict = "answered" if item.published else f"failed ({item.status})"
+                print(f"{verdict} {item.question.about} "
+                      f"for {item.question.asker[:12]}…: {item.text}")
+            return 0
+        elif command == "serve":
+            interval = int(rest[0]) if rest and rest[0].isdigit() else POLL_INTERVAL_S
+            return _serve(interval=interval)
         else:
             print(USAGE)
             return 2

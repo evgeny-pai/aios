@@ -318,6 +318,24 @@ if [ "${AIOS_BUZZ:-1}" = 1 ]; then
         announced*) step ok "buzz" "$buzz_line" ;;
         *) note "buzz" "not registered — ${buzz_line:-no relay at ${AIOS_BUZZ_URL:-the default}}" ;;
     esac
+
+    # Answer other nodes' questions, for as long as this machine is up.
+    #
+    # A background loop for the same reason the self-update poll above is one: PID 1
+    # never exits, so this lives as long as the pod. It only ever answers STRUCTURED
+    # questions from a closed set, from local measurement — it does not read prose and
+    # no model is involved, so nothing a peer writes can steer this machine. See the
+    # answering section of aios/buzz.py for why that constraint is not negotiable.
+    #
+    # Started even when the announce above failed: a relay that is down now may be up
+    # in a minute, and the loop reports and retries rather than exiting.
+    if [ "${AIOS_BUZZ_RESPOND:-1}" = 1 ]; then
+        (python3 -m aios.buzz serve "${AIOS_BUZZ_POLL_INTERVAL:-60}" \
+            >>/var/log/aios-buzz.log 2>&1 &) 2>/dev/null
+        step ok "buzz responder" "answering questions every ${AIOS_BUZZ_POLL_INTERVAL:-60}s → /var/log/aios-buzz.log"
+    else
+        note "buzz responder" "AIOS_BUZZ_RESPOND=0 — this node answers nobody"
+    fi
 else
     note "buzz" "AIOS_BUZZ=0 — this node will not announce itself"
 fi

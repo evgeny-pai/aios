@@ -52,6 +52,7 @@ error text — length buries the fix.
 | [docker-compose-plugin-unregistered](docker-compose-plugin-unregistered/SKILL.md) | `docker: unknown command: docker compose` with the plugin binary sitting right there |
 | [measure-request-shape-dont-infer](measure-request-shape-dont-infer/SKILL.md) | `invalid type: map, expected a sequence` — the envelope was wrong, not the fields |
 | [httperror-must-be-closed](httperror-must-be-closed/SKILL.md) | `ResourceWarning: Implicitly cleaning up <HTTPError 403>` reported from `tempfile` |
+| [nip98-needs-a-nonce](nip98-needs-a-nonce/SKILL.md) | `NIP-98: replay detected` on a legitimate poll — and the first test passed while the bug was live |
 
 ## Adding one
 
