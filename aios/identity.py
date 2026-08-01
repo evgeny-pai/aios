@@ -58,6 +58,14 @@ def operator(root: Path | None = None, *, create_account: bool = False) -> str:
     try:
         existing = path.read_text(encoding="utf-8").strip()
         if existing:
+            # A node that already has a handle is exactly the common case — every
+            # multi-generation node had one minted before this function ever grew
+            # `create_account` — and it must not be the one path that skips
+            # `ensure_account`. Without this, no amount of self-update or reboot
+            # ever creates the account on an existing node: this same function,
+            # called from both aios-init and aios-login, always takes this branch.
+            if create_account:
+                ensure_account(existing)
             return existing
     except OSError:
         pass

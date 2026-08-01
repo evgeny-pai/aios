@@ -58,6 +58,53 @@ class TestNodeName(unittest.TestCase):
             self.assertTrue(identity.node_name(Path(tempfile.mkdtemp())))
 
 
+class TestOperator(unittest.TestCase):
+    """`operator(create_account=True)` is the actual call both aios-init and
+    aios-login make — `ensure_account` directly, as `TestEnsureAccount` below
+    exercises it, is not the path either of them takes."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        (self.dir / ".aios").mkdir()
+        self.sudoers = self.dir / "sudoers.d" / "aios-operator"
+        patcher = mock.patch.object(identity, "SUDOERS", self.sudoers)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _wheel(self, members=()):
+        return mock.Mock(gr_mem=list(members))
+
+    def test_a_fresh_handle_gets_its_account_created(self):
+        with mock.patch.object(identity.pwd, "getpwnam", side_effect=KeyError), \
+             mock.patch.object(identity.grp, "getgrnam", return_value=self._wheel()), \
+             mock.patch.object(identity.subprocess, "run") as run:
+            identity.operator(self.dir, create_account=True)
+        run.assert_called()
+        self.assertTrue(self.sudoers.exists())
+
+    def test_an_existing_handle_still_gets_its_account_ensured(self):
+        """The bug this pins: every multi-generation node already had a handle
+        minted before `create_account` existed, so `if existing: return existing`
+        must not be the branch that skips `ensure_account` forever. Before the
+        fix this failed with `run.assert_called()` — the early return never
+        reached `ensure_account` at all, on any call, ever, for such a node."""
+        first = identity.operator(self.dir)  # mints, create_account defaults False
+        with mock.patch.object(identity.pwd, "getpwnam", side_effect=KeyError), \
+             mock.patch.object(identity.grp, "getgrnam", return_value=self._wheel()), \
+             mock.patch.object(identity.subprocess, "run") as run:
+            second = identity.operator(self.dir, create_account=True)
+        self.assertEqual(first, second, "an existing handle must not be replaced")
+        run.assert_called()
+        self.assertTrue(self.sudoers.exists(),
+                         "an existing handle must still get its account created")
+
+    def test_create_account_false_never_touches_the_account(self):
+        with mock.patch.object(identity, "ensure_account") as ensure:
+            identity.operator(self.dir)
+            identity.operator(self.dir)
+        ensure.assert_not_called()
+
+
 class TestEnsureAccount(unittest.TestCase):
     """The account the cockpit's shell pane drops to: wheel, plus the sudoers drop-in.
 
