@@ -74,6 +74,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import time
 import unittest
 from contextlib import contextmanager
@@ -2045,7 +2046,21 @@ class ReadingTheRegistry(unittest.TestCase):
 
     def test_read_finds_a_running_build_and_reports_it(self):
         self.entry.request(NOW - QUIET_S)
-        self.record("20260801-101010-0abc", pgid=os.getpgid(0))
+        # Needs a pgid that is both ours and definitely alive. `os.getpgid(0)` used to
+        # stand in for that, and it is wrong in exactly one case that is not rare here:
+        # the first process in a PID namespace (a Docker build's own RUN step, among
+        # others) is its own group leader with pgid 1 — the sentinel `build._alive`
+        # refuses to signal on purpose, since group 1 is not a group any job of ours
+        # is allowed to mean. A helper given its own session is guaranteed pid == pgid
+        # and > 1, which is what "alive and ours" actually requires.
+        helper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+
+        def cleanup() -> None:
+            helper.terminate()
+            helper.wait()
+
+        self.addCleanup(cleanup)
+        self.record("20260801-101010-0abc", pgid=helper.pid)
         state = dashboard.read(self.root, now=NOW)
         self.assertEqual(len(state.building), 1)
         self.assertEqual(state.health, dashboard.HEALTH_OK)

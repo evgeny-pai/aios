@@ -47,6 +47,7 @@ error text — length buries the fix.
 | [verify-the-diagnosis-before-fixing](verify-the-diagnosis-before-fixing/SKILL.md) | Nearly documented a capability the agent already had, and whose briefing already named it |
 | [urllib-ignores-userinfo](urllib-ignores-userinfo/SKILL.md) | `http://x:token@127.0.0.1/` → `nodename nor servname provided` — and the token in the error |
 | [zombie-reads-as-alive](zombie-reads-as-alive/SKILL.md) | A finished build reported `running` forever — `killpg(pgid, 0)` said EPERM, because nobody had reaped it |
+| [pid1-does-not-reap-orphans](pid1-does-not-reap-orphans/SKILL.md) | A test polling for an orphaned process to die failed identically at 10s, 30s and 60s of patience |
 
 ## Adding one
 

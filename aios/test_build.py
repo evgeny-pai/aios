@@ -96,6 +96,25 @@ def alive(pid: int) -> bool:
     return True
 
 
+#: A handful of tests here orphan a process on purpose — that is the feature under
+#: test, a job outliving the thing that started it — and then wait for it to stop
+#: existing. That requires SOMEBODY to reap it: Linux reparents an orphan to the
+#: nearest subreaper or, failing that, to PID 1, and a zombie is only removed from
+#: the process table once its parent calls wait() on it. A real init does this for
+#: every child, reparented or not; a bare shell running as PID 1 — a `docker build`
+#: RUN step, and this project's own aios-init before it grows a reaper (see the
+#: skill this documents) — does not, so the orphan's zombie answers `kill(pid, 0)`
+#: forever and these tests hang until patience runs out, deterministically, no
+#: matter how generous the patience. `os.getpgid(0) <= 1` is the same signal used
+#: elsewhere in this suite for "PID 1 has no session of its own", which in practice
+#: means "and therefore no reaper either" — a real init always gives itself one.
+needs_reaping_init = unittest.skipIf(
+    os.getpgid(0) <= 1,
+    "needs an init that reaps orphaned children; PID 1 here does not "
+    "(see skills/pid1-does-not-reap-orphans)",
+)
+
+
 class Base(unittest.TestCase):
     """A private state root, and every job started in it stopped again.
 
@@ -280,6 +299,7 @@ class Outliving(Base):
         self.assertTrue(alive(started["pid"]), "the job died with its starter")
         self.assertTrue(self.state(started["id"]).running)
 
+    @needs_reaping_init
     def test_a_shell_poll_puts_the_ending_in_the_audit_journal(self):
         """A build started from a shell and polled from a shell must still be auditable.
 
@@ -303,6 +323,7 @@ class Outliving(Base):
         self.assertEqual(exited[0]["code"], 0)
         self.assertEqual(exited[0]["author"], dashboard.AUTHOR_AGENT)
 
+    @needs_reaping_init
     def test_a_fresh_interpreter_finds_it_and_reads_its_exit_status(self):
         """The agent restarting, in full: a second process starts the job, we watch it
         finish, and a THIRD process — sharing no memory with either — reports the code.
@@ -427,6 +448,7 @@ class ExitStatus(Base):
 
 
 class Stopping(Base):
+    @needs_reaping_init
     def test_stop_kills_the_whole_group(self):
         """emerge spawns make, which spawns compilers. Killing the pid leaves the tree
         running — still holding the portage lock, still loading the machine — while
@@ -444,6 +466,7 @@ class Stopping(Base):
         self.assertIn("process group", message)
         self.assertIn("not a failed one", message)
 
+    @needs_reaping_init
     def test_a_stopped_job_is_vanished_with_the_reason_recorded(self):
         """The wrapper that records the status is inside the group being killed, so a
         stop leaves no status at all. Without the reason on the record, a deliberate
