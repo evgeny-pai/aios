@@ -212,6 +212,21 @@ spec:
           value: http://host.docker.internal:11434
         - name: AIOS_OLLAMA_MODEL
           value: qwen3:14b
+        # Self-update source. A node's peer-manifest update path (AIOS_UPDATE_URL,
+        # above) has nothing to fetch until another node publishes to it; the git
+        # remote this code was built from always exists, so it is the default rather
+        # than something a lone node waits on a peer to provide. HTTPS, not the SSH
+        # remote a workstation clone uses — the pod carries no SSH key or known_hosts,
+        # and this is a public repo, so an unauthenticated clone is the right shape.
+        - name: AIOS_GIT_REMOTE
+          value: https://github.com/evgeny-pai/aios.git
+        - name: AIOS_GIT_BRANCH
+          value: main
+        # Cheap to poll, but not free: git ls-remote is one round trip per interval,
+        # forever, for the life of the pod. Five minutes is the repo server's
+        # `--for=condition=Ready` timeout with room to spare, not a measurement.
+        - name: AIOS_GIT_POLL_INTERVAL
+          value: "300"
       envFrom:
         # Both optional: the pod must boot when no credentials have been created
         # yet, and must never be blocked from starting by their absence. A machine

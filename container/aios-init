@@ -186,6 +186,29 @@ else
     note "distccd" "sys-devel/distcc not installed — this node sends but cannot accept"
 fi
 
+# Self-update: poll this project's own git remote and promote a new commit through
+# the same gate-then-swap `aios.update` already uses for a peer's release (see
+# aios/update.py's git-apply). A lone node has no peer to publish to it, but it
+# always has the remote its own code came from, so that is the default source of
+# truth here rather than something left unconfigured until a peer exists.
+#
+# A background loop, not a single check: PID 1 never exits, so this runs for the
+# life of the pod, same shape as the repo server and distccd started above. Each
+# iteration is one short-lived `git-apply` invocation rather than a long-running
+# Python loop — cheap to reason about, and a stuck iteration cannot wedge the next
+# one since there is no shared state beyond files on disk.
+if [ "${AIOS_AUTOUPDATE:-1}" = 1 ] && [ -n "${AIOS_GIT_REMOTE:-}" ]; then
+    (
+        while :; do
+            python3 -m aios.update git-apply >>/var/log/aios-selfupdate.log 2>&1 || true
+            sleep "${AIOS_GIT_POLL_INTERVAL:-300}"
+        done
+    ) &
+    step ok "self-update" "polling ${AIOS_GIT_BRANCH:-main}@${AIOS_GIT_REMOTE} every ${AIOS_GIT_POLL_INTERVAL:-300}s"
+else
+    note "self-update" "AIOS_GIT_REMOTE not set — this node will not update itself"
+fi
+
 if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
     step ok "ai provider" "${AIOS_MODEL:-claude-haiku-4-5-20251001}"
 else

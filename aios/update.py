@@ -407,6 +407,123 @@ def rollback() -> str:
     )
 
 
+# --- a second consumer: polling this project's own git remote directly -------
+#
+# The peer path above (`check`/`apply`) is a manifest another AIos node published.
+# That has no meaning for a lone node with no peer — there is nothing to publish to
+# it. What such a node CAN always reach is the git remote its own code came from, so
+# this is the same gate-then-swap machinery with git standing in for the manifest:
+# `git ls-remote` in place of fetching `latest.json`, a shallow clone in place of
+# fetching a tarball, and the branch's commit sha in place of a sha256 as the version
+# identifier VERSION_FILE carries. gate()/swap_in()/install_outside() are unchanged —
+# a git checkout of this repository already has every PAYLOAD entry at the paths
+# swap_in expects, because that is simply this repository's own layout.
+#
+# Deliberately a separate pair of verbs (`git-check`/`git-apply`) rather than
+# overloading `check`/`apply`: the two sources have incompatible version-identifier
+# formats (git sha vs tarball sha256) and mixing them on one node would make
+# `installed()` ambiguous about which scheme produced it.
+
+
+def git_head(remote: str, branch: str) -> str:
+    """The commit `branch` points at on `remote`, without cloning anything."""
+    try:
+        done = subprocess.run(
+            ["git", "ls-remote", remote, f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise UpdateError(f"{remote}: {exc}") from None
+    if done.returncode != 0:
+        raise UpdateError(f"{remote}: {done.stderr.strip() or 'git ls-remote failed'}")
+    if not done.stdout.strip():
+        raise UpdateError(f"{remote}: no branch {branch!r}")
+    return done.stdout.split()[0]
+
+
+def check_git(remote: str, branch: str) -> str:
+    head = git_head(remote, branch)
+    here = installed()
+    if head == here:
+        return f"up to date ({head[:12]})"
+    return f"update available: {head[:12]}\n  running: {here[:12] or 'unknown'}"
+
+
+def apply_git(remote: str, branch: str, *, force: bool = False) -> str:
+    """Same gate-then-swap as `apply()`, sourced from a git branch instead of a peer.
+
+    A shallow clone rather than a fetch into an existing checkout: ROOT is not a git
+    repository (it is what a tarball or, here, a clone was extracted into), so there
+    is no history to fetch against — each run starts a fresh STAGE, exactly as the
+    tarball path does.
+    """
+    head = git_head(remote, branch)
+    if head == installed() and not force:
+        return f"already running {head[:12]}"
+
+    if STAGE.exists():
+        shutil.rmtree(STAGE)
+
+    try:
+        done = subprocess.run(
+            ["git", "clone", "--quiet", "--depth", "1", "--branch", branch,
+             remote, str(STAGE)],
+            capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise UpdateError(f"{remote}: {exc}") from None
+    if done.returncode != 0:
+        shutil.rmtree(STAGE, ignore_errors=True)
+        raise UpdateError(f"git clone failed: {done.stderr.strip()}")
+    shutil.rmtree(STAGE / ".git", ignore_errors=True)  # not part of the payload
+
+    missing = [item for item in PAYLOAD if not (STAGE / item).exists()]
+    if missing:
+        shutil.rmtree(STAGE)
+        raise UpdateError(f"candidate {head[:12]} is missing: {', '.join(missing)}")
+
+    failures = gate(STAGE)
+    if failures:
+        shutil.rmtree(STAGE)
+        raise UpdateError(
+            f"candidate {head[:12]} failed its own tests — not promoted:\n  "
+            + "\n  ".join(failures)
+        )
+
+    moved = swap_in(STAGE)
+    shutil.rmtree(STAGE, ignore_errors=True)
+    installed_paths, install_errors = install_outside()
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    VERSION_FILE.write_text(head + "\n", encoding="utf-8")
+    lines = [
+        f"promoted {head[:12]} ({branch}@{remote}): {', '.join(moved)}",
+        f"installed: {', '.join(installed_paths) or 'nothing outside /aios'}",
+    ]
+    if install_errors:
+        lines.append("COULD NOT INSTALL (the login path may still be the old one):")
+        lines += [f"  {problem}" for problem in install_errors]
+    lines.append(f"previous copies kept at {PREVIOUS} — `aios.update rollback` restores them")
+
+    # Re-serve what was just adopted from upstream. A node that only pulls from git
+    # is a dead end for every other node on this cluster: each of them would have to
+    # reach GitHub itself, for code this one already fetched and already gated. This
+    # is the existing peer half of the mechanism (`aios.repo serve` already publishes
+    # AIOS_SRC_DIR at :8080/src) — a node that keeps itself current from upstream
+    # becomes, for free, a peer other nodes can point AIOS_UPDATE_URL at instead.
+    #
+    # Best-effort: a publish failure must not turn a successful, already-gated
+    # promotion into a reported failure. AIOS_SRC_DIR is a volume in the shipped
+    # manifest (`aios-srv`); off that manifest it is a plain directory and still
+    # works, just without surviving a pod recreate.
+    try:
+        lines.append(publish(Path(os.environ.get("AIOS_SRC_DIR", "/srv/aios/src")),
+                              version=head[:12], source=ROOT))
+    except (UpdateError, OSError) as exc:
+        lines.append(f"NOT republished for peers: {exc}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     command = argv[0] if argv else "help"
@@ -426,10 +543,20 @@ def main(argv: list[str] | None = None) -> int:
             failures = gate(Path(argv[1]) if len(argv) > 1 else ROOT)
             print("green" if not failures else "RED:\n  " + "\n  ".join(failures))
             return 0 if not failures else 1
+        elif command in ("git-check", "git-apply"):
+            remote = os.environ.get("AIOS_GIT_REMOTE", "")
+            if not remote:
+                print("aios.update: AIOS_GIT_REMOTE not set", file=sys.stderr)
+                return 1
+            branch = os.environ.get("AIOS_GIT_BRANCH", "main")
+            if command == "git-check":
+                print(check_git(remote, branch))
+            else:
+                print(apply_git(remote, branch, force="--force" in argv))
         else:
             print(__doc__)
             print("usage: python3 -m aios.update {check|apply [--force]|rollback|"
-                  "publish <version>|gate [dir]}")
+                  "publish <version>|gate [dir]|git-check|git-apply [--force]}")
             return 2
     except UpdateError as exc:
         print(f"aios.update: {exc}", file=sys.stderr)
