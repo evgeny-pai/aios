@@ -46,6 +46,7 @@ error text — length buries the fix.
 | [no-way-to-rebuild-the-ui](no-way-to-rebuild-the-ui/SKILL.md) | Closing two tmux panes stranded the session — the layout was built once and never repaired |
 | [verify-the-diagnosis-before-fixing](verify-the-diagnosis-before-fixing/SKILL.md) | Nearly documented a capability the agent already had, and whose briefing already named it |
 | [urllib-ignores-userinfo](urllib-ignores-userinfo/SKILL.md) | `http://x:token@127.0.0.1/` → `nodename nor servname provided` — and the token in the error |
+| [zombie-reads-as-alive](zombie-reads-as-alive/SKILL.md) | A finished build reported `running` forever — `killpg(pgid, 0)` said EPERM, because nobody had reaped it |
 
 ## Adding one
 

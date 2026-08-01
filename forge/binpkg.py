@@ -37,9 +37,10 @@ libX11 is the same class of defect as a vacuously-green probe
 feature is absent, the ELF says otherwise. Believe the ELF.
 
 What this trusts, stated plainly, because a green verdict here is what gates
-`emerge --getbinpkg`: the package is a peer's file, fetched unauthenticated (see
-`portage.binhost_env`), so every field below is that peer's claim. Two rules keep
-a claim from becoming a certification. First, forge must read the same bytes
+`emerge --getbinpkg`: the package is a peer's file, and every field below is that
+peer's claim. A token-gated binhost changes nothing about that — `_credential`
+proves to the PEER who is asking, and proves nothing to us about what came back.
+Two rules keep a claim from becoming a certification. First, forge must read the same bytes
 portage will: the container is identified by its tar header and never by a
 trailer that can be appended to a valid archive, and the metadata member is
 checked against the `Manifest` portage itself verifies. Second, a gap is never
@@ -50,6 +51,7 @@ of negative decisions by accident, which would certify anything.
 
 from __future__ import annotations
 
+import base64
 import bz2
 import hashlib
 import io
@@ -1526,11 +1528,12 @@ def _shown(source: str) -> str:
     """A source as a human, a log or a Fit may carry it — never its userinfo.
 
     A peer's binhost URL authenticates by userinfo, because portage fetches it with
-    wget/curl and there is no header to set (`portage.binhost_env`). `--peer` is
-    therefore routinely handed a live credential — `aios.mesh.binhost_url()` builds
-    exactly that URL and says in its own docstring that it is unredacted. Every string
-    below that a human can end up reading goes through here; only the argument to
-    `_http_get` stays whole, because that one has to dial.
+    wget/curl and PORTAGE_BINHOST has no header to set (`portage.binhost_env`).
+    `--peer` is therefore routinely handed a live credential — `aios.mesh.binhost_url()`
+    builds exactly that URL and says in its own docstring that it is unredacted. Every
+    string below that a human can end up reading goes through here; only the argument
+    to `_http_get` stays whole, because that one has to spend the credential
+    (`_credential` takes it out of the URL and puts it in a header).
     """
     return portage_mod.redact_url(source)
 
@@ -1637,7 +1640,18 @@ class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
             raise refuse
         if _origin(newurl) != _origin(req.full_url):
             raise refuse
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        following = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if following is not None:
+            # urllib drops an unredirected header when it follows a 3xx, which is
+            # the right default and the reason `_http_get` sets the credential that
+            # way — but here the two origins have just been compared and found
+            # equal, so re-attaching sends it to the host it already went to and
+            # nowhere else. Without this a token-gated binhost that redirects
+            # `/binpkgs` to `/binpkgs/` answers 401 to the second request.
+            credential = req.get_header("Authorization")
+            if credential:
+                following.add_unredirected_header("Authorization", credential)
+        return following
 
 
 #: One opener, built once. `build_opener` drops the default redirect handler in
@@ -1654,8 +1668,45 @@ def _origin(url: str) -> tuple[str, str, int]:
     )
 
 
+def _credential(url: str) -> tuple[str, str]:
+    """(the URL to dial, an Authorization header value) — userinfo taken out of the URL.
+
+    A binhost authenticates by userinfo because portage fetches one with wget/curl,
+    which implement `http://user:pass@host/` and cannot be handed a header from
+    PORTAGE_BINHOST (`portage.binhost_env`). `urllib.request` does NOT implement it:
+    `Request._parse` splits off the scheme and stops, so `http.client` receives
+    `user:pass@host:port` *as the host*, takes the last colon for the port and
+    resolves the rest. Every token-gated peer therefore failed name resolution —
+    a DNS error for a literal IP address, with the live token printed in front of
+    it, which is the worse half of the bug. RFC 7617 is what wget and curl put on
+    the wire for such a URL, so sending it here is what makes the two fetchers
+    agree about one URL rather than one of them silently getting nothing.
+
+    The userinfo is percent-decoded first for exactly that reason: wget and curl
+    decode it, and a credential this encodes differently from the one portage
+    spends is a credential that authenticates for only one of them.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.username is None:
+        return url, ""
+    user = urllib.parse.unquote(parts.username)
+    password = urllib.parse.unquote(parts.password or "")
+    basic = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+    # rpartition, not partition: a password may legally contain a `@`.
+    bare = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()
+    return bare, f"Basic {basic}"
+
+
 def _http_get(url: str, *, timeout: float, limit: int, first: int | None = None) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "forge-binpkg"})
+    # The URL that gets DIALLED is the credential-free one; `url` stays whole and is
+    # only ever quoted back through `_shown`, so no message below can carry a token.
+    dial, credential = _credential(url)
+    request = urllib.request.Request(dial, headers={"User-Agent": "forge-binpkg"})
+    if credential:
+        # Unredirected: urllib will not carry it across a 3xx on its own, so a peer
+        # cannot bounce this fetch and collect the token. `_PinnedRedirect` puts it
+        # back after it has proved the target is the same origin.
+        request.add_unredirected_header("Authorization", credential)
     if first is not None:
         request.add_header("Range", f"bytes=0-{first - 1}")
     try:

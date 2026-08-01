@@ -11,6 +11,7 @@ comparing raw USE against the lockfile without intersecting IUSE.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import io
@@ -1229,6 +1230,12 @@ class PeerFixture(Fixture):
     other's cases — one of them builds a 2 MiB package.
     """
 
+    def peer_handler(self):
+        """The handler this suite's binhost runs. Resolved late, so it can name a
+        handler defined further down the file — `TestPeerCredential` swaps in one
+        that demands the credential instead of ignoring it."""
+        return _QuietHandler
+
     def setUp(self):
         super().setUp()
         root = self.tmp / "binpkgs"
@@ -1240,7 +1247,7 @@ class PeerFixture(Fixture):
             "CPV: evil/escape-1\nPATH: ../../etc/passwd\n",
             encoding="utf-8",
         )
-        handler = partial(_QuietHandler, directory=str(self.tmp))
+        handler = partial(self.peer_handler(), directory=str(self.tmp))
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -1340,50 +1347,61 @@ class TestPeerCredential(PeerFixture):
     """A peer URL authenticates by userinfo, so `--peer` is handed a live token.
 
     `portage.binhost_env` puts the credential in the URL because portage fetches a
-    binhost with wget/curl and there is no header to set, and `aios.mesh.binhost_url`
-    builds exactly that URL — its own docstring says it is unredacted. `forge build
-    --peer` learned to redact before printing; this command takes the same argument
-    and printed it three ways: the detail line, the `read over plain HTTP from` line
-    (whose `netloc` includes the userinfo), and every read error, which is prefixed
-    with the URL. The same real server, so the credential travels the real path.
+    binhost with wget/curl and PORTAGE_BINHOST has no header to set, and
+    `aios.mesh.binhost_url` builds exactly that URL — its own docstring says it is
+    unredacted. Two things have to hold for such a URL, and they pull in opposite
+    directions: the credential must reach the WIRE, and it must reach nothing else.
+
+    urllib gave neither. It does not implement userinfo — `Request._parse` hands
+    `x:tok@host:port` to `http.client` as the hostname — so every fetch died in DNS,
+    and that message is prefixed with the URL, which put the live token on the
+    terminal. `_credential` moves it into an RFC 7617 header, so this suite's binhost
+    DEMANDS that header: every test below that reads anything is also proof the
+    credential was spent, and no stand-in transport stands between forge and the
+    socket.
     """
 
     #: Distinctive enough that a substring search cannot pass by accident, and shaped
     #: like the mesh token it stands in for.
     TOKEN = "s3cr3t-mesh-token"
 
-    def authed(self, path: str = "") -> str:
+    def peer_handler(self):
+        return partial(_AuthHandler, expect=basic_auth("x", self.TOKEN))
+
+    def authed(self, path: str = "", token: str | None = None) -> str:
         scheme, _, rest = self.base.partition("://")
-        return f"{scheme}://x:{self.TOKEN}@{rest}{path}"
+        return f"{scheme}://x:{self.TOKEN if token is None else token}@{rest}{path}"
 
     def host_port(self) -> str:
         return f"127.0.0.1:{self.server.server_address[1]}"
 
-    @contextlib.contextmanager
-    def authenticating_transport(self):
-        """Stand in for a fetcher that can spend the userinfo urllib ignores.
+    def test_a_userinfo_url_is_fetched_by_spending_the_credential(self):
+        """The bug itself: `--peer http://x:tok@host/` could not read a binhost at all.
 
-        `urllib` does not implement it: `http.client` takes `Request.host` verbatim, so
-        `http://x:tok@host/` fails DNS rather than authenticating. portage's wget/curl
-        do, which is the whole reason `portage.binhost_env` puts the token in the URL —
-        so the credential handed to `--peer` is real, and today it can only reach an
-        error message. Stripping it in the transport, the one place that legitimately
-        sees it, exercises the reporting paths a working fetcher would reach.
+        The peer answers 401 to a request without the header, so reading tmux's
+        metadata off it is not merely "the fetch stopped failing" — it is the token
+        arriving where wget and curl would have put it.
         """
-        real = binpkg_mod._http_get
+        meta = binpkg_mod.fetch(self.authed("/app-misc/tmux-3.5a-1.gpkg.tar"))
+        self.assertEqual(meta.atom, "app-misc/tmux")
+        self.assertEqual(meta.build_time, 1785171285)
+        self.assertNotIn(self.TOKEN, meta.source)
 
-        def dial(url, **kwargs):
-            scheme, _, rest = url.partition("://")
-            head, sep, tail = rest.partition("@")
-            return real(f"{scheme}://{tail if sep else head}", **kwargs)
+    def test_the_peer_really_refuses_a_fetch_that_spends_nothing(self):
+        """Guards the test above: without it, an ungated server would pass it too."""
+        with self.assertRaises(binpkg_mod.BinpkgError) as caught:
+            binpkg_mod.fetch(f"{self.base}/app-misc/tmux-3.5a-1.gpkg.tar")
+        self.assertIn("401", str(caught.exception))
 
-        with mock.patch.object(binpkg_mod, "_http_get", dial):
-            yield
+    def test_a_wrong_token_is_a_401_and_is_not_quoted_back(self):
+        with self.assertRaises(binpkg_mod.BinpkgError) as caught:
+            binpkg_mod.fetch(self.authed("/app-misc/tmux-3.5a-1.gpkg.tar", token="wrong"))
+        self.assertIn("401", str(caught.exception))
+        self.assertNotIn("wrong", str(caught.exception))
 
     def test_a_successful_peer_check_names_the_host_and_not_the_token(self):
         lock = write_lock(self.tmp, packages=[pkg("app-misc/tmux", TMUX_LOCK_USE)])
-        with self.authenticating_transport():
-            code, out = self.run_cli("--lock", str(lock), "binpkg", "--peer", self.authed())
+        code, out = self.run_cli("--lock", str(lock), "binpkg", "--peer", self.authed())
         self.assertEqual(code, 0, out)
         self.assertIn("app-misc/tmux-3.5a", out, "the check has to have really run")
         self.assertNotIn(self.TOKEN, out)
@@ -1394,32 +1412,17 @@ class TestPeerCredential(PeerFixture):
     def test_a_read_failure_quotes_the_url_redacted(self):
         """The error path is the leakiest: ~30 messages are prefixed with the source."""
         lock = write_lock(self.tmp, packages=[pkg("app-misc/tmux", TMUX_LOCK_USE)])
-        with self.authenticating_transport():
-            code, out = self.run_cli("--lock", str(lock), "binpkg",
-                                     self.authed("/app-misc/absent-1.gpkg.tar"))
+        code, out = self.run_cli("--lock", str(lock), "binpkg",
+                                 self.authed("/app-misc/absent-1.gpkg.tar"))
         self.assertEqual(code, 1, out)
         self.assertIn("404", out, "the failure has to be the one we asked for")
         self.assertNotIn(self.TOKEN, out)
         self.assertIn(self.host_port(), out)
 
-    def test_the_transport_error_urllib_gives_a_userinfo_url_is_redacted_too(self):
-        """No patched transport here: this is what a real `--peer <token url>` does now.
-
-        urllib hands `x:tok@host:port` to `http.client` as the host, so the fetch dies
-        in DNS — and that message is prefixed with the URL, which is how the token
-        reached the terminal in the first place.
-        """
-        lock = write_lock(self.tmp, packages=[pkg("app-misc/tmux", TMUX_LOCK_USE)])
-        code, out = self.run_cli("--lock", str(lock), "binpkg", "--peer", self.authed())
-        self.assertEqual(code, 1, out)
-        self.assertNotIn(self.TOKEN, out)
-        self.assertIn(portage_mod.REDACTION, out)
-
     def test_a_dropped_index_entry_does_not_quote_the_token_either(self):
         """The index is a peer's text, and the line rejecting it names the binhost."""
-        with self.authenticating_transport():
-            with contextlib.redirect_stdout(io.StringIO()) as buf:
-                sources = binpkg_mod.peer_sources(self.authed())
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            sources = binpkg_mod.peer_sources(self.authed())
         printed = buf.getvalue()
         self.assertIn("dropped index entry", printed)
         self.assertNotIn(self.TOKEN, printed)
@@ -1431,15 +1434,86 @@ class TestPeerCredential(PeerFixture):
     def test_the_fit_a_caller_may_log_carries_no_credential(self):
         """`Fit.source` and `Metadata.source` are report fields, not fetch targets."""
         lock = self.tmux_lock()
-        with self.authenticating_transport():
-            fit = binpkg_mod.examine(self.authed("/app-misc/tmux-3.5a-1.gpkg.tar"), lock)
-            broken = binpkg_mod.examine(self.authed("/app-misc/absent-1.gpkg.tar"), lock)
+        fit = binpkg_mod.examine(self.authed("/app-misc/tmux-3.5a-1.gpkg.tar"), lock)
+        broken = binpkg_mod.examine(self.authed("/app-misc/absent-1.gpkg.tar"), lock)
         self.assertEqual(fit.verdict, binpkg_mod.EXACT)
         for text in (fit.source, fit.meta.source, *(r.text for r in fit.reasons)):
             self.assertNotIn(self.TOKEN, text)
         self.assertEqual(broken.verdict, binpkg_mod.ERROR)
         for text in (broken.source, *(r.text for r in broken.reasons)):
             self.assertNotIn(self.TOKEN, text)
+
+    def test_the_whole_object_fallback_authenticates_too(self):
+        """`fetch` dials twice for an xpak, and the second dial is a separate Request."""
+        xpak_tbz2(self.tmp / "binpkgs" / "app-misc", files=TMUX)
+        meta = binpkg_mod.fetch(self.authed("/app-misc/tmux-3.5a.tbz2"), probe_bytes=512)
+        self.assertEqual(meta.format, "xpak")
+        self.assertEqual(meta.atom, "app-misc/tmux")
+
+    def test_a_percent_encoded_token_is_decoded_the_way_wget_decodes_it(self):
+        """Two fetchers, one URL: forge must send the credential portage sends.
+
+        wget and curl percent-decode a URL's userinfo before authenticating with it,
+        so a `+` written `%2B` is a `+` on the wire for them. Sending the literal
+        `%2B` instead would authenticate for exactly one of the two tools.
+        """
+        self.assertEqual(
+            binpkg_mod._credential("http://portage:a%2Bb%40c@host:4748/binpkgs"),
+            ("http://host:4748/binpkgs", basic_auth("portage", "a+b@c")),
+        )
+
+    def test_a_url_without_userinfo_is_dialled_unchanged_and_unauthenticated(self):
+        self.assertEqual(
+            binpkg_mod._credential("http://aios-repo:8080/binpkgs"),
+            ("http://aios-repo:8080/binpkgs", ""),
+        )
+
+
+class TestPeerCredentialRedirect(Fixture):
+    """Where the credential may follow a 3xx, and where it must not.
+
+    `add_unredirected_header` alone drops it on every redirect, which is safe and
+    breaks the ordinary binhost that 302s a path to another path on itself.
+    `_PinnedRedirect` re-attaches it only after proving the target is the same
+    origin, so these two cases are the whole rule.
+    """
+
+    TOKEN = "s3cr3t-mesh-token"
+
+    def setUp(self):
+        super().setUp()
+        _Internal.hits = 0
+        _Internal.credentials = []
+        self.internal = self.serve(_Internal)
+        root = self.tmp / "binpkgs" / "app-misc"
+        root.mkdir(parents=True)
+        gpkg(root, files=TMUX)
+
+    def serve(self, handler) -> str:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_a_same_origin_redirect_still_carries_the_credential(self):
+        base = self.serve(partial(
+            _AuthAliasHandler, directory=str(self.tmp), expect=basic_auth("x", self.TOKEN)
+        ))
+        scheme, _, rest = base.partition("://")
+        url = f"{scheme}://x:{self.TOKEN}@{rest}/alias/binpkgs/app-misc/tmux-3.5a-1.gpkg.tar"
+        meta = binpkg_mod.fetch(url)
+        self.assertEqual(meta.atom, "app-misc/tmux")
+
+    def test_a_redirect_to_another_host_never_sees_the_credential(self):
+        peer = self.serve(type("_ToInternal3", (_Redirector,), {"target": self.internal + "/x"}))
+        scheme, _, rest = peer.partition("://")
+        with self.assertRaises(binpkg_mod.BinpkgError) as caught:
+            binpkg_mod.fetch(f"{scheme}://x:{self.TOKEN}@{rest}/app-misc/tmux-3.5a-1.gpkg.tar")
+        self.assertIn("refused", str(caught.exception))
+        self.assertNotIn(self.TOKEN, str(caught.exception))
+        self.assertEqual(_Internal.hits, 0, "the redirect target was contacted anyway")
+        self.assertEqual(_Internal.credentials, [])
 
 
 class TestPeerRedirect(Fixture):
@@ -1512,12 +1586,17 @@ class _Internal(BaseHTTPRequestHandler):
     """Stands in for whatever else the node can reach. Counts every hit."""
 
     hits = 0
+    #: Every Authorization header this was offered. A redirect that leaks a peer's
+    #: token to a third host is a worse outcome than one that merely fetches from it.
+    credentials: list[str] = []
 
     def log_message(self, *args):
         pass
 
     def do_GET(self):
         _Internal.hits += 1
+        if self.headers.get("Authorization"):
+            _Internal.credentials.append(self.headers["Authorization"])
         body = b"SECRET-internal-credentials-body"
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -1553,6 +1632,54 @@ class _QuietHandler(SimpleHTTPRequestHandler):
             # behaviour under test, not a server fault. Without this the
             # stdlib prints a traceback over the test output.
             self.close_connection = True
+
+
+def basic_auth(user: str, password: str) -> str:
+    """The RFC 7617 header wget and curl send for `http://user:password@host/`."""
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+
+
+class _AuthHandler(_QuietHandler):
+    """A token-gated binhost: 401 to anything that does not present the credential.
+
+    The one thing a stand-in transport cannot check is whether the token reaches the
+    wire at all. Serving the tree only to a correct Authorization header makes every
+    successful read in `TestPeerCredential` evidence that it did.
+    """
+
+    def __init__(self, *args, expect: str, **kwargs):
+        # Before super(): BaseHTTPRequestHandler.__init__ handles the whole request.
+        self.expect = expect
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        if self.headers.get("Authorization") != self.expect:
+            body = b"unauthorized\n"
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="binhost"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+
+class _AuthAliasHandler(_AuthHandler):
+    """Token-gated, and 302s /alias/<path> to /<path> on this same origin.
+
+    The redirect itself is answered unauthenticated, as a front end that routes
+    before it authenticates would: the credential has to survive onto the SECOND
+    request or the package comes back 401.
+    """
+
+    def do_GET(self):
+        if self.path.startswith("/alias/"):
+            self.send_response(302)
+            self.send_header("Location", self.path[len("/alias"):])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_GET()
 
 
 class TestCli(Fixture):

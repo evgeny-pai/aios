@@ -60,6 +60,20 @@ are in is counted, not guessed: one assistant turn can issue several tool calls
 and they return one record at a time, so a fast `read_file` coming back does not
 mean the `emerge` beside it is finished.
 
+**A running build is not silence at all.** `aios.build` runs an emerge as a detached
+job with no time limit, and the job writes to its own log rather than to this journal —
+so a three-hour compile is a journal that says nothing for three hours. That is the
+case this pane exists for and the case it would have got most wrong: read through the
+thresholds above it is `STUCK`, and read with nothing open it is `IDLE`. Neither is
+true, and both are the specific failure `skills/tool-budget-shorter-than-task` is
+about — a machine that reports honest long work as a fault teaches everyone to stop
+reading the indicator. So the build registry is a second input, read the same way as
+the journal (from disk, without writing a byte: `record=False`, because a monitor that
+appends to what it reads certifies its own subject alive), and a running build outranks
+every silence threshold here. It also excuses the one shape of repetition this whole
+mechanism is *made* of: polling `build_status` for the same job is not a loop, it is
+the design, and counted as a loop it would paint `LOOPING` through every long build.
+
 **Pure reader.** No writes, no model call, no network, no subprocess: tmux runs
 `status` every two seconds and a status bar that can block is a multiplexer that
 hangs. The journal is read from the *tail* — a single tool record can be 20 kB, so
@@ -94,9 +108,17 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import build as build_mod
 from . import generation, welcome
 
 JOURNAL = ".aios/agent.jsonl"
+
+#: Tool calls whose repetition is the mechanism working, not an agent going round in
+#: circles. A three-hour build is *supposed* to be many identical `build_status` calls —
+#: that is the whole start/poll/read pattern — so counting them as a loop would make
+#: `LOOPING` the permanent reading of every long compile. Discounted only while a build
+#: is actually running: polling a job that ended hours ago is a loop like any other.
+POLL_TOOLS = frozenset({"build_status", "build_tail"})
 
 #: How much of the journal's tail is read. One tool record can carry 20 kB of
 #: build log, so this is a few dozen records — the window the cockpit shows —
@@ -411,6 +433,15 @@ class State:
     ended: Ending = Ending()
     note: str = ""
     skipped: int = 0
+    #: Every detached build this node knows about, newest first — the second input, and
+    #: the only one that does not come out of the journal. Read, never written.
+    builds: tuple[build_mod.Status, ...] = ()
+
+    @property
+    def building(self) -> tuple[build_mod.Status, ...]:
+        """The builds that are actually running. Long silence from one of these is the
+        work happening, so this is what outranks the thresholds below."""
+        return tuple(state for state in self.builds if state.running)
 
     @property
     def silence(self) -> float:
@@ -503,10 +534,17 @@ def _is_boundary(event: Event) -> bool:
     return event.kind == "verify" and bool(event.data.get("ok"))
 
 
-def looping(events: Sequence[Event], limit: int = LOOP_N) -> str:
+def looping(
+    events: Sequence[Event], limit: int = LOOP_N, ignore: frozenset[str] = frozenset()
+) -> str:
     """The same call or the same red verdict `limit` times in a row, described.
 
     `events` must already be scoped to one run — see `_BOUNDARY`.
+
+    `ignore` names tools whose records are dropped from the sequence rather than
+    breaking it — see `POLL_TOOLS`. Dropped rather than treated as a boundary on
+    purpose: an agent alternating one real repeated call with a poll would otherwise
+    have every repetition hidden by the polling it is entitled to do.
     """
     calls = [
         (
@@ -514,7 +552,7 @@ def looping(events: Sequence[Event], limit: int = LOOP_N) -> str:
             json.dumps(e.data.get("input"), sort_keys=True, default=str),
         )
         for e in events
-        if e.kind == "tool"
+        if e.kind == "tool" and str(e.data.get("name") or "?") not in ignore
     ]
     repeats = _run_length(calls)
     if repeats >= limit:
@@ -540,6 +578,7 @@ def digest(
     note: str = "",
     skipped: int = 0,
     gen: int = 0,
+    builds: Sequence[build_mod.Status] = (),
 ) -> State:
     """Fold the journal into "what is open, and is it healthy".
 
@@ -663,11 +702,13 @@ def digest(
     silence = max(0.0, now - last_ts) if last_ts else 0.0
     cold = bool(last_ts) and silence > COLD_S
     agents = () if cold else tuple(running.values())
+    building = tuple(state for state in builds if state.running)
     health, why = _health(
-        agents, events[boundary:], now, last_ts, note, bool(running) and cold, ended, stalled
+        agents, events[boundary:], now, last_ts, note, bool(running) and cold, ended,
+        stalled, building,
     )
     if ahead:
-        health, why = _skewed(health, why, ahead, bool(last_ts))
+        health, why = _skewed(health, why, ahead, bool(last_ts) or bool(building))
 
     return State(
         now=now,
@@ -687,6 +728,7 @@ def digest(
         ended=ended,
         note=note,
         skipped=skipped,
+        builds=tuple(builds),
     )
 
 
@@ -725,8 +767,19 @@ def _health(
     abandoned: bool,
     ended: Ending,
     stalled: str = "",
+    building: Sequence[build_mod.Status] = (),
 ) -> tuple[str, str]:
     """`window` is the current run's events only — anything earlier is another run.
+
+    `building` is the running detached builds, and it outranks every silence threshold
+    below. A compile writes to its own log, not to this journal, so a build that has
+    printed nothing here for twenty minutes is a build — and the thresholds would call
+    it `STUCK` while an empty journal alongside it would call it `IDLE`. Both are wrong
+    and both are worse than wrong: an indicator that fires during correct operation is
+    an indicator nobody reads, which is exactly how a real stall gets missed. The one
+    signal ranked above it is `LOOPING`, because that is a statement about the *agent*
+    rather than about the work, and an agent going in circles beside a healthy build is
+    still an agent going in circles.
 
     `stalled` is the supervisor's outstanding "this is not progressing", and it is the
     only input here that did not come out of the machine's own records. It is ranked
@@ -744,14 +797,19 @@ def _health(
     machine's own account of how the run closed, `RED` and `ASK` are already alarms,
     and any of those records retires the diagnosis anyway (`RETIRE_N`).
     """
-    if not last_ts:
+    if not last_ts and not building:
         return HEALTH_IDLE, note or "nothing has run yet"
 
-    silence = max(0.0, now - last_ts)
+    silence = max(0.0, now - last_ts) if last_ts else 0.0
     if agents:
-        loop = looping(window)
+        # Scoped before the build check, because a loop is the one fault a running
+        # build does not excuse. Poll calls are discounted only while one is running.
+        loop = looping(window, ignore=POLL_TOOLS if building else frozenset())
         if loop:
             return HEALTH_LOOPING, loop
+    if building:
+        return HEALTH_OK, building_why(building, now)
+    if agents:
         allowed = TOOL_SILENCE_S if agents[-1].outstanding else MODEL_SILENCE_S
         if silence > allowed:
             return HEALTH_STUCK, (
@@ -772,6 +830,26 @@ def _health(
     if stalled:
         return HEALTH_STUCK, f"no agent running — supervisor: {stalled}"
     return HEALTH_IDLE, f"no agent running, last event {ago(silence)} ago"
+
+
+def building_why(
+    running: Sequence[build_mod.Status], now: float, limit: int = 200
+) -> str:
+    """Why the machine is healthy while its journal says nothing: it is compiling.
+
+    Says the elapsed time because that is the number an operator is actually deciding
+    on — "building for 8s" and "building for 3h 20m" are the same health and completely
+    different news — and names what is being built, scrubbed like every other string
+    here: the atoms came from the model and travelled through the registry on disk.
+    """
+    oldest = max(running, key=lambda state: state.elapsed)
+    what = plain(oldest.job.what if oldest.job else "?", 60)
+    more = f" (+{len(running) - 1} more)" if len(running) > 1 else ""
+    return plain(
+        f"building {what}{more} for {ago(oldest.elapsed)} — no time limit, and a quiet "
+        "build log is a build compiling",
+        limit,
+    )
 
 
 def _outcome(ended: Ending, age: float) -> tuple[str, str]:
@@ -798,8 +876,14 @@ def ago(seconds: float) -> str:
 
 
 def heartbeat(state: State, marks: Marks) -> str:
-    """A glyph that moves only while an agent is open — and freezes when stuck."""
-    if not state.agents:
+    """A glyph that moves while work is open — and freezes when stuck.
+
+    A running build counts as work even with no agent open, which is the ordinary shape
+    of a long compile: the agent started the job and stopped, and the job has hours to
+    go. A still glyph means "nothing is running", so leaving it still through a
+    three-hour build would make it say the one thing that was not true.
+    """
+    if not state.agents and not state.building:
         return marks.rest
     if state.health == HEALTH_STUCK:
         return marks.frames[0]
@@ -827,15 +911,36 @@ def short_model(name: str) -> str:
 
 
 def read(root: Path | str | None = None, now: float | None = None) -> State:
+    when = time.time() if now is None else now
     lines, note = _tail(journal_path(root))
     events, skipped = _events(lines)
     return digest(
         events,
-        time.time() if now is None else now,
+        when,
         note=note,
         skipped=skipped,
         gen=_generation(root),
+        builds=_builds(root, when),
     )
+
+
+def _builds(root: Path | str | None, now: float) -> tuple[build_mod.Status, ...]:
+    """The build registry, read the way the journal is: from disk, and never written.
+
+    `record=False` is the load-bearing argument. `aios.build.status` journals the moment
+    it first observes a job's exit, and a display that took that write would be
+    appending to the file it reads its own subject's health out of — the bug
+    `skills/monitor-writes-what-it-reads` is named after, where the status bar said `ok`
+    for eleven minutes because the watcher kept writing about the stall. Whoever polls a
+    build on purpose gets to record its ending; this pane only looks.
+
+    Broad `except` for the reason `main` has one: this is the tmux status hot path, and
+    a pane that stops drawing is indistinguishable from a machine with nothing to do.
+    """
+    try:
+        return tuple(build_mod.report(root, now=now, record=False, last_line=True))
+    except Exception:
+        return ()
 
 
 def _generation(root: Path | str | None) -> int:
@@ -889,10 +994,19 @@ def status_line(state: State, colour: bool | None = None, marks: Marks | None = 
     gen = str(state.generation) if state.generation else "?"
 
     dot = paint(marks.rest, faint)
+    segments = [
+        paint(heartbeat(state, marks), label),
+        paint(f"agents {count}", label),
+    ]
+    # A build takes hours and the agent that started it is usually gone, so without
+    # this the one line a human glances at has nothing on it while the machine is
+    # doing the longest thing it ever does. In the label colour, not the warn one:
+    # a compile is work, not a fault.
+    if state.building:
+        segments += [dot, paint(_tmux_safe(build_segment(state.building)), label)]
     return " ".join(
-        [
-            paint(heartbeat(state, marks), label),
-            paint(f"agents {count}", label),
+        segments
+        + [
             dot,
             paint(middle, faint),
             dot,
@@ -901,6 +1015,18 @@ def status_line(state: State, colour: bool | None = None, marks: Marks | None = 
             health,
         ]
     )
+
+
+def build_segment(running: Sequence[build_mod.Status]) -> str:
+    """`build 2h 14m`, or `builds 3 2h 14m` — the longest-running one's elapsed time.
+
+    Short because the status bar is: the atoms go on the pane, which has room, and the
+    number a glance is for is how long this has been going.
+    """
+    longest = max(state.elapsed for state in running)
+    if len(running) == 1:
+        return f"build {ago(longest)}"
+    return f"builds {len(running)} {ago(longest)}"
 
 
 # --- the pane -----------------------------------------------------------------
@@ -1000,6 +1126,49 @@ def _agent_rows(state: State, width: int, glyphs: welcome.Glyphs, marks: Marks) 
     return rows
 
 
+#: How many builds the pane shows. The registry keeps every job this node ever ran, and
+#: a pane thirty-four columns wide has room for the ones still deciding something.
+BUILD_ROWS = 3
+
+
+def _build_rows(state: State, width: int, glyphs: welcome.Glyphs) -> list[Row]:
+    """The builds section: what is compiling, for how long, and its last log line.
+
+    Running ones first regardless of age, because they are the only ones that are still
+    a question. A finished one stays visible for a while on purpose — `exited 1` is the
+    thing an operator most needs to walk back into, and the journal line that recorded
+    it scrolls away.
+    """
+    order = sorted(state.builds, key=lambda s: (not s.running, -s.elapsed))
+    rows: list[Row] = []
+    for entry in order[:BUILD_ROWS]:
+        job = entry.job
+        if job is None:
+            continue
+        what = plain(job.what, max(8, width - 12))
+        if entry.running:
+            head, tone = f"{ago(entry.elapsed)} building", "accent"
+        elif entry.state == build_mod.EXITED and entry.code == 0:
+            head, tone = f"{ago(entry.elapsed)} ok  exit 0", "ok"
+        elif entry.state == build_mod.EXITED:
+            head, tone = f"{ago(entry.elapsed)} FAIL exit {entry.code}", "warn"
+        else:
+            # Gone with no status recorded. Not a pass, and painted like the open
+            # question it is: nothing here ever proved this build finished.
+            head, tone = f"{ago(entry.elapsed)} vanished, exit unknown", "warn"
+        rows.append(_row((f"{glyphs.caret} ", tone), (what, tone)))
+        rows.append(_row(("  ", ""), (head, tone)))
+        if entry.last:
+            # The build's own stdout, so `plain` is not decoration here: this is
+            # executed package code writing into a terminal pane.
+            rows.append(_row(("  ", ""), (f"{glyphs.dot} ", "faint"),
+                             (plain(entry.last, max(8, width - 4)), "")))
+    hidden = len(state.builds) - len(order[:BUILD_ROWS])
+    if hidden > 0:
+        rows.append(_row((f"{hidden} older build(s)", "faint")))
+    return rows
+
+
 def journal_rows(
     state: State, limit: int, glyphs: welcome.Glyphs, marks: Marks, stamp: str = "%H:%M:%S"
 ) -> list[Row]:
@@ -1051,6 +1220,20 @@ def _event_body(event: Event, glyphs: welcome.Glyphs, marks: Marks) -> tuple[str
         return f"{marks.bang} deferral {plain(data.get('quote'), 60)}", "warn"
     if kind == "budget":
         return f"{marks.stop} budget spent ({plain(data.get('label'), 20)})", "warn"
+    if kind == build_mod.KIND_STARTED:
+        return f"{marks.into} build {plain(' '.join(_names(data.get('atoms'))) or '@aios', 40)}", ""
+    if kind == build_mod.KIND_EXITED:
+        code = data.get("code")
+        if data.get("stopped"):
+            return f"{marks.stop} build stopped ({plain(data.get('job'), 24)})", "warn"
+        if code is None:
+            # The audit trail's version of `vanished`: no status was ever recorded, so
+            # this line must not read like an ending that went fine.
+            return f"{marks.bang} build vanished, exit unknown", "warn"
+        took = f"  {data.get('elapsed_s')}s" if data.get("elapsed_s") is not None else ""
+        if _int(code) == 0:
+            return f"ok  build exit 0{took}", "ok"
+        return f"FAIL build exit {plain(code, 8)}{took}", "warn"
     if kind == "advice":
         return f"{marks.star} {plain(data.get('text'))}", "label"
     if kind == "log_failed":
@@ -1092,6 +1275,14 @@ def watch_rows(
 
     head.append(_heading("agents", str(len(state.agents)), body))
     head += _agent_rows(state, body, glyphs, marks)
+
+    # Above the advice and below the agents: a build is the machine's own work, and the
+    # section is omitted entirely when there are none rather than saying "no builds" —
+    # unlike agents, whose absence is itself the answer to "is anything happening".
+    if state.builds:
+        head.append(_row())
+        head.append(_heading("builds", str(len(state.building)), body))
+        head += _build_rows(state, body, glyphs)
 
     if state.advice:
         head.append(_row())

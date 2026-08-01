@@ -84,7 +84,13 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("build", help="emerge the lockfile's package set")
     p.add_argument("--root", default="/", help="build into this root")
-    p.add_argument("--execute", action="store_true", help="really build (default is --pretend)")
+    # One flag per mode, mutually exclusive, even though pretend is still the default.
+    # `--pretend` was previously only expressible as "no --execute", which left
+    # `--detach` no way to say what it contradicts.
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--execute", action="store_true", help="really build (default is --pretend)")
+    mode.add_argument("--pretend", action="store_true", help="print emerge's plan and build nothing — the default")
+    p.add_argument("--detach", action="store_true", help="start the build as a job with NO time limit and print its id, then return. Survives this shell, your terminal and a reboot of the tmux client; poll it with `python3 -m aios.build status <id>`. Requires --execute")
     p.add_argument("--peer", default="", help="reuse a peer's binary packages, e.g. http://aios-repo:8080/binpkgs (env: AIOS_BINHOST). Prebuilt packages whose USE flags disagree with the lock are rejected, not installed")
     p.add_argument("--distcc", action="store_true", help="take the mesh's compile hosts as DISTCC_HOSTS. Needs FEATURES=distcc in the spec and a distccd on each peer; with neither, every compile runs locally and the build still works")
     p.set_defaults(handler=cmd_build)
@@ -236,21 +242,28 @@ def cmd_render(args) -> int:
     return 0
 
 
+#: Said once, because it is the only thing `--detach --pretend` needs to hear.
+DETACH_PRETEND = (
+    "--detach and --pretend are a contradiction. A plan is something you read now, and "
+    "a detached job is work nobody is waiting for — there is no plan to come back to. "
+    "Pass `--detach --execute` to start the build, or drop --detach to print the plan."
+)
+
+
 def cmd_build(args) -> int:
+    # Before the lockfile is even read: a contradiction between two flags is answered
+    # from the flags, and "your lockfile is stale" would be an unhelpful thing to say
+    # first to somebody who asked for two incompatible things.
+    if args.detach and not args.execute:
+        raise Fail(DETACH_PRETEND)
     lock = lock_mod.load(args.lock)
     peer = args.peer or os.environ.get("AIOS_BINHOST", "")
-    argv = portage_mod.emerge_argv(
-        lock, root=args.root, pretend=not args.execute, binhost=bool(peer)
-    )
-    # Both accelerators are environment-only, and for one reason: which machines are
-    # up is a fact about this moment. The lockfile refuses either key by name.
-    overrides: dict[str, str] = {}
     if peer:
         # A peer's binary packages are an accelerator, never an authority: portage
         # still resolves the graph from the rendered lockfile, and --binpkg-respect-use
         # makes it reject any prebuilt package whose flags disagree and build from
         # source instead. So reuse can save time but cannot change what you get.
-        overrides.update(portage_mod.binhost_env(peer))
+        #
         # Redacted, because the natural way to produce this argument is
         # `--peer "$(python3 -c 'import aios.mesh; print(aios.mesh.binhost_url())')"`
         # and `binhost_url` says in its own docstring that it is unredacted — the
@@ -258,19 +271,30 @@ def cmd_build(args) -> int:
         # on a terminal and, under the agent, into `.aios/agent.jsonl` forever.
         print(f"reusing binary packages from {portage_mod.redact_url(peer)} "
               "where the USE flags match", file=sys.stderr)
-    if args.distcc:
+    if args.distcc and not _FEATURE_DISTCC.search(_feature_line(lock)):
         # A host list is only half of a distributed build. The other half is whether
         # portage routes compiles through distcc at all, and that half is in the lock
         # already loaded above — so check it rather than reporting a quiet mesh and
         # letting the reader debug the network for a lockfile problem.
-        if not _FEATURE_DISTCC.search(_feature_line(lock)):
-            print(
-                "the lockfile's FEATURES has no `distcc`, so portage will not route "
-                "compiles through it —\nDISTCC_HOSTS is exported and ignored, and "
-                "every compile runs locally. Run\n`forge lower && forge render` "
-                "first (`forge diff` says whether this lock predates the spec).",
-                file=sys.stderr,
-            )
+        print(
+            "the lockfile's FEATURES has no `distcc`, so portage will not route "
+            "compiles through it —\nDISTCC_HOSTS is exported and ignored, and "
+            "every compile runs locally. Run\n`forge lower && forge render` "
+            "first (`forge diff` says whether this lock predates the spec).",
+            file=sys.stderr,
+        )
+    if args.detach:
+        return _detach(args, lock, peer)
+
+    argv = portage_mod.emerge_argv(
+        lock, root=args.root, pretend=not args.execute, binhost=bool(peer)
+    )
+    # Both accelerators are environment-only, and for one reason: which machines are
+    # up is a fact about this moment. The lockfile refuses either key by name.
+    overrides: dict[str, str] = {}
+    if peer:
+        overrides.update(portage_mod.binhost_env(peer))
+    if args.distcc:
         # Imported here, not at module scope: forge is the pure pipeline and has to
         # stay importable on a machine that carries no node code at all. The mesh is
         # asked once, and it never raises — no mesh means an empty host list, which
@@ -290,6 +314,46 @@ def cmd_build(args) -> int:
         print("(--pretend; pass --execute to build)", file=sys.stderr)
     print("+ " + " ".join(argv), file=sys.stderr)
     return subprocess.run(argv, env=env).returncode
+
+
+def _detach(args, lock: dict, peer: str) -> int:
+    """Start the build as a detached job and print its id.
+
+    One mechanism, not two: this is the same `aios.build.start` the agent's build_start
+    calls, so a job a human began at a shell and a job the agent began are the same kind
+    of object, appear in the same registry, and are polled by the same commands. A CLI
+    that grew its own private nohup would have been a second answer to the question
+    `skills/tool-budget-shorter-than-task` is about, and the second answer is always the
+    one nobody keeps working.
+
+    Imported here rather than at module scope for the reason the mesh import above is:
+    forge is the pure pipeline, and it has to stay importable on a machine carrying no
+    node code at all.
+    """
+    from aios import build as build_mod
+
+    try:
+        job = build_mod.start(
+            binhost=peer,
+            distcc=args.distcc,
+            lock=lock,
+            lock_path=args.lock,
+            emerge_root=args.root,
+        )
+    except build_mod.BuildError as exc:
+        raise Fail(str(exc)) from None
+    # The id alone on stdout, so `id=$(forge build --detach --execute)` is the obvious
+    # thing and it works. Everything a human wants to read goes to stderr.
+    print(job.id)
+    print(
+        f"started {job.id} detached — no time limit, and it survives this shell "
+        f"closing.\n  log:    {job.log}\n"
+        f"  poll:   python3 -m aios.build status {job.id}\n"
+        f"  follow: python3 -m aios.build tail {job.id}\n"
+        f"  stop:   python3 -m aios.build stop {job.id}",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def cmd_binpkg(args) -> int:

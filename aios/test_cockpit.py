@@ -35,6 +35,18 @@ testable at all, because all of them are statements about *time*:
 - the journal is the only input to all of it, so `aios.tools` must refuse to author
   it: a forged record can name any writer, any timestamp and any verdict, and a
   watcher that cannot trust its input cannot report the fault it would be hiding;
+- a RUNNING BUILD is the case this pane would have got most wrong, so it has a block of
+  its own below. An emerge is a detached job with no time limit that writes to its own
+  log, so a three-hour compile is a journal saying nothing for three hours — read
+  through the silence thresholds that is `STUCK`, and read with the run already closed
+  it is `IDLE`. Both are false, and a fault indicator that fires during correct
+  operation is one nobody reads. Every arm that could produce either token is asserted
+  against a quiet build, including the supervisor's stall diagnosis, which is raised by
+  exactly the shape a long build has;
+- and polling is not looping. The whole start/poll/read mechanism IS repeated identical
+  `build_status` calls, so counting them would paint `LOOPING` through every long build —
+  while polling a job that ended hours ago is still a loop, and a real repeated call
+  beside a healthy build is still a loop;
 - the heartbeat must not move while nothing is happening, or it is decoration;
 - the journal is appended to while it is read, so an absent file, an empty file, a
   one-line file and a half-written final line are all normal inputs;
@@ -68,7 +80,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import dashboard, llm, supervisor, tools, welcome
+from . import build, dashboard, llm, supervisor, tools, welcome
 
 #: A fixed instant. Nothing in this suite reads the real clock, so nothing in it
 #: can pass or fail depending on when it ran.
@@ -1716,6 +1728,359 @@ class JournalIntegrity(unittest.TestCase):
         state = read(self.entry)
         self.assertEqual(state.health, dashboard.HEALTH_DONE)
         self.assertEqual(state.agents, ())
+
+
+# --- a build is running -------------------------------------------------------
+
+#: A quarter of an hour of a compile printing nothing. Past `MODEL_SILENCE_S` and past
+#: `TOOL_SILENCE_S`, so every threshold on this pane has already fired by the time these
+#: tests look — which is the point: this is an ordinary linking step, not a fault.
+QUIET_S = 3_600.0
+
+
+def a_build(
+    state: str = build.RUNNING,
+    *,
+    atoms: tuple[str, ...] = ("app-editors/vim",),
+    elapsed: float = QUIET_S,
+    code: int | None = None,
+    last: str = "",
+    job_id: str = "20260801-101010-0abc",
+) -> build.Status:
+    """One entry of the build registry, as the reader hands it to the display.
+
+    Synthesized rather than started, for the reason nothing in this suite starts
+    anything: every property here is a statement about *time*, and a test that had to
+    wait an hour for a quiet build would be a test nobody runs.
+    """
+    job = build.Job(
+        id=job_id,
+        atoms=atoms,
+        argv=("emerge", "--verbose", *atoms),
+        pid=4242,
+        pgid=4242,
+        started=NOW - elapsed,
+        log=f".aios/builds/{job_id}.log",
+        exit_file=f".aios/builds/{job_id}.exit",
+    )
+    return build.Status(state, job=job, code=code, elapsed=elapsed, last=last)
+
+
+def with_builds(entry: Journal, *builds: build.Status, now: float = NOW) -> dashboard.State:
+    """The same digest `read` performs, with the registry supplied rather than read."""
+    lines, note = dashboard._tail(dashboard.journal_path(entry.root))
+    events, skipped = dashboard._events(lines)
+    return dashboard.digest(events, now, note=note, skipped=skipped, builds=builds)
+
+
+class BuildIsRunning(unittest.TestCase):
+    """A compile that prints nothing for an hour is a compile, not a hang.
+
+    Getting this wrong is the whole reason the health token exists: an indicator that
+    cries through the longest correct operation this machine performs is an indicator
+    a human learns to ignore, and then the real stall goes past unread.
+    """
+
+    def test_a_long_quiet_build_reads_as_running(self):
+        with journal() as entry:
+            entry.request(NOW - QUIET_S).reply(NOW - QUIET_S, tool_calls=("build_start",))
+            entry.tool(NOW - QUIET_S, name="build_start", atoms="app-editors/vim")
+            state = with_builds(entry, a_build())
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+        self.assertNotEqual(state.health, dashboard.HEALTH_STUCK)
+        self.assertIn("building app-editors/vim", state.why)
+        self.assertIn("1h 00m", state.why)
+        self.assertIn("no time limit", state.why)
+
+    def test_a_build_with_no_agent_left_open_is_not_idle(self):
+        """The ordinary shape of a long build: the agent started it and stopped, and the
+        job has hours to go. Nothing is open, and the machine is very much working."""
+        with journal() as entry:
+            entry.request(NOW - QUIET_S).verify(NOW - QUIET_S, True)
+            state = with_builds(entry, a_build())
+        self.assertNotEqual(state.health, dashboard.HEALTH_IDLE)
+        self.assertNotEqual(state.health, dashboard.HEALTH_DONE)
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+        self.assertIn("building", state.why)
+
+    def test_a_build_running_with_an_empty_journal_is_not_idle(self):
+        """`forge build --detach` from the shell, with no agent involved at all."""
+        with journal() as entry:
+            state = with_builds(entry, a_build())
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+        self.assertIn("building", state.why)
+
+    def test_a_build_outlasting_cold_s_is_still_a_build(self):
+        """`COLD_S` is two hours and a toolchain is longer than that. Read through the
+        abandoned-run arm this said IDLE — a machine hung with nobody home — about the
+        one case where the machine is provably busy."""
+        with journal() as entry:
+            entry.request(NOW - 20_000).reply(NOW - 19_990, tool_calls=("build_start",))
+            entry.tool(NOW - 19_980, name="build_start", atoms="sys-devel/gcc")
+            state = with_builds(entry, a_build(atoms=("sys-devel/gcc",), elapsed=19_000))
+        self.assertEqual(state.agents, (), "the run itself is cold, correctly")
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+        self.assertIn("5h 16m", state.why)
+
+    def test_a_stall_diagnosis_does_not_outrank_a_running_build(self):
+        """The supervisor raises this from a journal that is not progressing — which is
+        precisely what a three-hour compile looks like from the journal. It can raise an
+        alarm about the AGENT; it has no vote on whether a compiler is compiling."""
+        with journal() as entry:
+            entry.request(NOW - QUIET_S).reply(NOW - QUIET_S, tool_calls=("build_start",))
+            entry.tool(NOW - QUIET_S, name="build_start")
+            entry.advice(NOW - 60, stall=True)
+            state = with_builds(entry, a_build())
+        self.assertEqual(state.stalled, STALL_ADVICE, "the diagnosis is still recorded")
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+        self.assertIn("agent is stuck in exploratory", "\n".join(lines(state)),
+                      "and still displayed — it is audit trail either way")
+
+    def test_a_finished_build_stops_excusing_the_silence(self):
+        """The exemption is scoped to a build that is actually running. Once it has
+        exited, an hour of silence waiting for a model reply is a stall again."""
+        with journal() as entry:
+            entry.request(NOW - QUIET_S).reply(NOW - QUIET_S, tool_calls=("run_shell",))
+            entry.tool(NOW - QUIET_S)  # the call returned; we are waiting for a reply
+            state = with_builds(entry, a_build(build.EXITED, code=0))
+        self.assertGreater(QUIET_S, dashboard.MODEL_SILENCE_S)
+        self.assertEqual(state.health, dashboard.HEALTH_STUCK)
+
+    def test_the_status_bar_says_a_build_is_running_and_for_how_long(self):
+        with journal() as entry:
+            entry.request(NOW - QUIET_S)
+            state = with_builds(entry, a_build())
+        bar = dashboard.status_line(state, colour=False)
+        self.assertIn("build 1h 00m", bar)
+        self.assertIn(dashboard.HEALTH_OK, bar)
+
+    def test_the_status_bar_counts_several_builds_and_shows_the_longest(self):
+        with journal() as entry:
+            state = with_builds(
+                entry,
+                a_build(elapsed=90.0, job_id="20260801-101010-0abc"),
+                a_build(elapsed=7_400.0, job_id="20260801-090000-0bcd"),
+            )
+        self.assertIn("builds 2 2h 03m", dashboard.status_line(state, colour=False))
+
+    def test_the_status_bar_is_silent_about_builds_that_ended(self):
+        """The bar is one line. A finished build is news for the pane, not for a glance."""
+        with journal() as entry:
+            entry.request(NOW - 10)
+            state = with_builds(entry, a_build(build.EXITED, code=0, elapsed=30.0))
+        self.assertNotIn("build ", dashboard.status_line(state, colour=False))
+
+    def test_the_heartbeat_moves_while_a_build_runs_with_nothing_open(self):
+        """A still glyph means "nothing is running". Through a three-hour build that is
+        the one thing it must not say."""
+        with journal() as entry:
+            entry.request(NOW - QUIET_S).verify(NOW - QUIET_S, True)
+            state = with_builds(entry, a_build())
+        self.assertEqual(state.agents, ())
+        self.assertNotEqual(
+            dashboard.heartbeat(state, dashboard.MARKS_U), dashboard.MARKS_U.rest
+        )
+
+    def test_the_pane_shows_the_atoms_the_elapsed_time_and_the_last_log_line(self):
+        with journal() as entry:
+            entry.request(NOW - QUIET_S)
+            state = with_builds(
+                entry,
+                a_build(atoms=("app-editors/vim", "dev-vcs/git"),
+                        last="  CC       src/main.o"),  # indented, as make prints it
+            )
+        pane = "\n".join(lines(state, width=60))
+        self.assertIn("b u i l d s", pane, "the section has a heading like the others")
+        self.assertIn("app-editors/vim dev-vcs/git", pane)
+        self.assertIn("1h 00m building", pane)
+        # Whitespace-collapsed by `plain`, like every other journal string that
+        # reaches this pane: a build log's own indentation must not lay out the display.
+        self.assertIn("CC src/main.o", pane)
+
+    def test_the_pane_names_a_failed_build_as_failed(self):
+        with journal() as entry:
+            state = with_builds(entry, a_build(build.EXITED, code=1, elapsed=900.0))
+        pane = "\n".join(lines(state, width=60))
+        self.assertIn("FAIL exit 1", pane)
+
+    def test_the_pane_never_paints_a_vanished_build_as_finished(self):
+        """No status was recorded, so nothing proved this build finished. It is the open
+        question on the pane, not a tick."""
+        with journal() as entry:
+            state = with_builds(entry, a_build(build.VANISHED, elapsed=900.0))
+        pane = "\n".join(lines(state, width=60))
+        self.assertIn("vanished, exit unknown", pane)
+        self.assertNotIn("exit 0", pane)
+
+    def test_the_pane_omits_the_section_when_this_node_has_never_built(self):
+        """Unlike agents, whose absence is itself the answer to "is anything happening"."""
+        with journal() as entry:
+            entry.request(NOW - 10)
+            state = with_builds(entry)
+        self.assertNotIn("b u i l d s", "\n".join(lines(state, width=60)))
+
+    def test_the_pane_does_not_wrap_or_tear_on_a_narrow_pane(self):
+        with journal() as entry:
+            state = with_builds(
+                entry,
+                a_build(atoms=("app-editors/vim", "sys-devel/gcc", "dev-vcs/git"),
+                        last="x" * 400),
+            )
+        for line in lines(state, width=NARROW, height=40):
+            self.assertLessEqual(len(bare(line)), NARROW, repr(line))
+
+    def test_a_build_log_line_cannot_repaint_the_pane(self):
+        """The last log line is executed package code's stdout, on its way to a terminal."""
+        with journal() as entry:
+            state = with_builds(entry, a_build(last="\x1b[2J\x1b[Hall tests passed"))
+        pane = "\n".join(lines(state, width=60, height=40))
+        self.assertIn("all tests passed", pane)
+        self.assertNotIn("\x1b[2J", pane)
+
+    def test_the_transitions_render_in_the_journal_pane(self):
+        with journal() as entry:
+            entry.request(NOW - 300)
+            entry.add(NOW - 290, build.KIND_STARTED, job="20260801-101010-0abc",
+                      atoms=["app-editors/vim"], log="x", pid=4242)
+            entry.add(NOW - 10, build.KIND_EXITED, job="20260801-101010-0abc",
+                      atoms=["app-editors/vim"], code=0, elapsed_s=280.0)
+            state = with_builds(entry, a_build(build.EXITED, code=0, elapsed=280.0))
+        pane = "\n".join(lines(state, width=60, height=40))
+        self.assertIn("build app-editors/vim", pane)
+        self.assertIn("build exit 0", pane)
+
+    def test_a_build_that_vanished_is_not_journalled_as_a_clean_ending(self):
+        with journal() as entry:
+            entry.request(NOW - 300)
+            entry.add(NOW - 10, build.KIND_EXITED, job="20260801-101010-0abc",
+                      atoms=["app-editors/vim"], code=None)
+            state = with_builds(entry)
+        self.assertIn("build vanished, exit unknown", "\n".join(lines(state, width=60)))
+
+    def test_a_build_transition_moves_the_liveness_clock(self):
+        """It is the machine doing work, and it carries `author` to say so — otherwise a
+        node whose only recent activity is builds reads as a node doing nothing."""
+        with journal() as entry:
+            entry.add(NOW - 5, build.KIND_STARTED, author=dashboard.AUTHOR_AGENT,
+                      job="20260801-101010-0abc", atoms=["app-editors/vim"])
+            state = with_builds(entry)
+        self.assertEqual(state.last_ts, NOW - 5)
+
+
+class PollingIsNotLooping(unittest.TestCase):
+    """The mechanism is many identical calls. Counted as a loop it would condemn itself."""
+
+    def polling(self, entry: Journal, times: int, ts: float = NOW - QUIET_S) -> Journal:
+        entry.request(ts)
+        for index in range(times):
+            entry.reply(ts + index, tool_calls=("build_status",))
+            entry.tool(ts + index, name="build_status", job_id="20260801-101010-0abc")
+        return entry
+
+    def test_polling_the_same_job_is_not_a_loop_while_it_runs(self):
+        with journal() as entry:
+            self.polling(entry, dashboard.LOOP_N + 3)
+            state = with_builds(entry, a_build())
+        self.assertNotEqual(state.health, dashboard.HEALTH_LOOPING)
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+
+    def test_polling_a_job_that_ended_hours_ago_is_a_loop_like_any_other(self):
+        """The exemption is for the build, not for the tool name."""
+        with journal() as entry:
+            self.polling(entry, dashboard.LOOP_N + 3, ts=NOW - 30)
+            state = with_builds(entry, a_build(build.EXITED, code=0))
+        self.assertEqual(state.health, dashboard.HEALTH_LOOPING)
+        self.assertIn("build_status", state.why)
+
+    def test_a_real_repeated_call_beside_a_healthy_build_is_still_a_loop(self):
+        """A loop is a statement about the agent, and a compiler running elsewhere does
+        not make one go away. So the poll records are dropped from the sequence rather
+        than breaking it — an agent alternating a repeat with a poll is still repeating."""
+        with journal() as entry:
+            entry.request(NOW - 300)
+            for index in range(dashboard.LOOP_N):
+                entry.reply(NOW - 300 + index * 2, tool_calls=("run_shell", "build_status"))
+                entry.tool(NOW - 300 + index * 2, name="run_shell", command="emerge --info")
+                entry.tool(NOW - 299 + index * 2, name="build_status", job_id="x")
+            state = with_builds(entry, a_build())
+        self.assertEqual(state.health, dashboard.HEALTH_LOOPING)
+        self.assertIn("run_shell", state.why)
+
+    def test_the_exempt_tools_are_only_the_polling_ones(self):
+        """build_start and build_stop are actions. Three identical build_starts is an
+        agent that has lost track of what it launched, and that is worth saying."""
+        self.assertEqual(dashboard.POLL_TOOLS, {"build_status", "build_tail"})
+
+
+class ReadingTheRegistry(unittest.TestCase):
+    """The second input, wired up for real — and read without writing a byte."""
+
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.entry = Journal(self.root)
+
+    def record(self, job_id: str, *, pgid: int, exit_code: str | None = None) -> build.Job:
+        """A registry record for a build nothing started.
+
+        `pgid` is the whole trick: our own process group is certainly alive, so a record
+        naming it reads as running through the real liveness path, with no process
+        started, nothing to clean up and no sleeping. Which is also the recycled-pgid
+        case `build._alive` warns about — here used on purpose.
+        """
+        directory = build.registry(self.root)
+        directory.mkdir(parents=True, exist_ok=True)
+        job = build.Job(
+            id=job_id, atoms=("app-editors/vim",), argv=("emerge", "-v", "app-editors/vim"),
+            pid=pgid, pgid=pgid, started=NOW - QUIET_S,
+            log=str(directory / f"{job_id}.log"),
+            exit_file=str(directory / f"{job_id}.exit"),
+        )
+        (directory / f"{job_id}.json").write_text(json.dumps(job.record()), encoding="utf-8")
+        Path(job.log).write_text("checking for gcc... yes\n  CC  main.o\n", encoding="utf-8")
+        if exit_code is not None:
+            Path(job.exit_file).write_text(exit_code, encoding="utf-8")
+        return job
+
+    def test_read_finds_a_running_build_and_reports_it(self):
+        self.entry.request(NOW - QUIET_S)
+        self.record("20260801-101010-0abc", pgid=os.getpgid(0))
+        state = dashboard.read(self.root, now=NOW)
+        self.assertEqual(len(state.building), 1)
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
+        self.assertIn("CC main.o", "\n".join(lines(state, width=60)))
+
+    def test_reading_writes_nothing_to_the_journal_it_reads(self):
+        """`build.status` journals an exit the first time it sees one, and a display that
+        took that write would be appending to the file it reads its subject's health out
+        of — which is the bug the status bar said `ok` through for eleven minutes.
+        """
+        self.record("20260801-101010-0abc", pgid=1, exit_code="1")
+        before = dashboard.journal_path(self.root).read_text()
+        for _ in range(5):
+            state = dashboard.read(self.root, now=NOW)
+        self.assertEqual(dashboard.journal_path(self.root).read_text(), before)
+        self.assertEqual(len(state.builds), 1)
+        self.assertEqual(state.builds[0].code, 1)
+        self.assertFalse(list(build.registry(self.root).glob("*.logged")))
+
+    def test_a_registry_that_cannot_be_read_does_not_stop_the_pane(self):
+        """A monitor whose output stops moving is indistinguishable from a quiet box."""
+        self.entry.request(NOW - 10)
+        (self.root / build.STATE / build.BUILDS).mkdir(parents=True)
+        (self.root / build.STATE / build.BUILDS / "20260801-101010-0abc.json").write_text(
+            "{ truncated", encoding="utf-8"
+        )
+        state = dashboard.read(self.root, now=NOW)
+        self.assertEqual(state.builds, ())
+        self.assertTrue(lines(state))
+
+    def test_no_registry_at_all_is_the_ordinary_case(self):
+        self.entry.request(NOW - 10)
+        state = dashboard.read(self.root, now=NOW)
+        self.assertEqual(state.builds, ())
+        self.assertEqual(state.health, dashboard.HEALTH_OK)
 
 
 # --- the keys the cockpit advertises -----------------------------------------

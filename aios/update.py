@@ -100,6 +100,7 @@ GATE = (
     # still be installable — a rollback target that cannot be installed is not one.
     ("cockpit", ("-m", "unittest", "aios.test_cockpit")),
     ("mesh", ("-m", "unittest", "aios.test_mesh")),
+    ("build", ("-m", "unittest", "aios.test_build")),
 )
 
 
