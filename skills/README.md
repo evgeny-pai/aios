@@ -48,6 +48,10 @@ error text — length buries the fix.
 | [urllib-ignores-userinfo](urllib-ignores-userinfo/SKILL.md) | `http://x:token@127.0.0.1/` → `nodename nor servname provided` — and the token in the error |
 | [zombie-reads-as-alive](zombie-reads-as-alive/SKILL.md) | A finished build reported `running` forever — `killpg(pgid, 0)` said EPERM, because nobody had reaped it |
 | [pid1-does-not-reap-orphans](pid1-does-not-reap-orphans/SKILL.md) | A test polling for an orphaned process to die failed identically at 10s, 30s and 60s of patience |
+| [workflow-args-not-interpolated](workflow-args-not-interpolated/SKILL.md) | Five subagents searched for a path that was the literal string `undefined` |
+| [docker-compose-plugin-unregistered](docker-compose-plugin-unregistered/SKILL.md) | `docker: unknown command: docker compose` with the plugin binary sitting right there |
+| [measure-request-shape-dont-infer](measure-request-shape-dont-infer/SKILL.md) | `invalid type: map, expected a sequence` — the envelope was wrong, not the fields |
+| [httperror-must-be-closed](httperror-must-be-closed/SKILL.md) | `ResourceWarning: Implicitly cleaning up <HTTPError 403>` reported from `tempfile` |
 
 ## Adding one
 

@@ -101,6 +101,12 @@ GATE = (
     ("cockpit", ("-m", "unittest", "aios.test_cockpit")),
     ("mesh", ("-m", "unittest", "aios.test_mesh")),
     ("build", ("-m", "unittest", "aios.test_build")),
+    # The signer is on the gate because it is the one module here whose failure mode
+    # is silent: a wrong Schnorr implementation produces signatures that verify
+    # against themselves, so nothing complains until a relay refuses every event this
+    # node ever sends. aios/test_bip340.py runs the 19 official BIP-340 vectors.
+    ("bip340", ("-m", "unittest", "aios.test_bip340")),
+    ("buzz", ("-m", "unittest", "aios.test_buzz")),
 )
 
 

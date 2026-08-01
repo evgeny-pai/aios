@@ -300,6 +300,28 @@ else
     note "self-update" "AIOS_GIT_REMOTE not set — this node will not update itself"
 fi
 
+# Register on the buzz relay, if there is one.
+#
+# ORDERING IS LOAD-BEARING and this block must stay below the two above it. What a
+# node announces is MEASURED, not declared: aios.buzz.capability probes the repo
+# server on :8080 and distccd on :3632 to decide what this node offers. Announcing
+# before those daemons are up would publish a node that advertises nothing, and kind 0
+# is replaceable — so the understatement would stand until the next boot, and every
+# peer deciding whether to ask this machine for a package would read it.
+#
+# Never fatal, and never a required check. A node with no relay is a working node that
+# nobody has introduced yet; treating that as a boot failure would make the whole
+# machine depend on a service it does not need in order to build anything.
+if [ "${AIOS_BUZZ:-1}" = 1 ]; then
+    buzz_line=$(python3 -m aios.buzz announce 2>&1 | head -1)
+    case "$buzz_line" in
+        announced*) step ok "buzz" "$buzz_line" ;;
+        *) note "buzz" "not registered — ${buzz_line:-no relay at ${AIOS_BUZZ_URL:-the default}}" ;;
+    esac
+else
+    note "buzz" "AIOS_BUZZ=0 — this node will not announce itself"
+fi
+
 if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
     step ok "ai provider" "${AIOS_MODEL:-claude-haiku-4-5-20251001}"
 else

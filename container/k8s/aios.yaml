@@ -197,6 +197,18 @@ spec:
         # it. A URL is not a credential, so it belongs here; the token does not.
         - name: AIOS_MESH_URL
           value: http://host.docker.internal:4748
+        # The buzz relay this node registers on, announces its capabilities to, and
+        # asks questions of. Same category as AIOS_MESH_URL above — topology, not a
+        # credential — and the same route, because a relay runs on the HOST (it needs
+        # postgres, redis and object storage beside it) while this is a pod.
+        #
+        # A URL pointing at nothing is harmless and deliberate: aios-init reports "not
+        # registered" and boots normally, so this can be set before a relay exists.
+        # The node's identity key is minted on the state volume, never injected here —
+        # a secret in a manifest is destroyed by the next `apply`
+        # (see the aios-agent note at the top of this file).
+        - name: AIOS_BUZZ_URL
+          value: http://host.docker.internal:3000
         # Where the LOCAL model lives, for the spec's `fallback` provider chain.
         #
         # Not an AIOS_PROVIDER/AIOS_MODEL override — those are still deliberately absent

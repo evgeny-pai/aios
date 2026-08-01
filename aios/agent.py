@@ -44,7 +44,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import dashboard, llm, node, tools, welcome
+from . import buzz, dashboard, llm, node, tools, welcome
 
 LOG_PATH = ".aios/agent.jsonl"
 
@@ -578,12 +578,23 @@ class Agent:
         failure: #2 held the only tree on the network and served it, and still called
         serving "handled separately", because nothing in its context said the network
         depended on it.
+
+        Two briefings, gathered independently. `node` says what this machine is to the
+        build mesh; `buzz` says who it is to the wider network and what it has told
+        them it can do. Each is wrapped separately so an unreachable relay costs the
+        agent one paragraph rather than the whole measured half of its prompt — the
+        failure that motivated the outer guard applies just as well to the inner one.
         """
         try:
-            return f"{SYSTEM}\n\n{node.briefing()}"
+            parts = [SYSTEM, node.briefing()]
         except Exception:
             # A briefing that cannot be measured must not cost the agent its prompt.
             return SYSTEM
+        try:
+            parts.append(buzz.briefing())
+        except Exception:
+            pass
+        return "\n\n".join(parts)
 
     # -- public
 

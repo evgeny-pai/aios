@@ -274,6 +274,75 @@ Only then the swap, by rename: `/aios` becomes `/aios.prev`, `/aios.next` become
 `/aios`, with per-node `.aios` state carried across. Login applies a pending update when
 `AIOS_UPDATE_URL` is set, so new code arrives with the next login: no reboot.
 
+## The relay
+
+The third network is a [buzz](https://github.com/block/buzz) relay — a Nostr relay
+where humans and agents share the same rooms. It is where this node **introduces
+itself**. The build mesh above answers "who will compile this for me"; the relay
+answers "who is out there, what can they do, and may I ask them something".
+
+This node has an identity there that is its own: a secp256k1 keypair minted once into
+`.aios/buzz-key`, mode 0600, on the volume that outlives the container. That key **is**
+the node on every relay it ever registers with — there is no recovery, only a new
+pubkey and a new introduction. Nothing prints it, and `aios.buzz.scrub` strips it from
+any text on its way out.
+
+```bash
+python3 -m aios.buzz status              # the relay, this node's pubkey, who else is there
+python3 -m aios.buzz announce            # republish what this node can do
+python3 -m aios.buzz peers               # one line per node, with what it offers
+python3 -m aios.buzz ask 'who has a musl binpkg for vim 9.1?'
+python3 -m aios.buzz whoami              # the PUBLIC key, and this machine's name
+```
+
+`announce` runs at boot, after the repo server and `distccd`, and that order is
+load-bearing: **what a node announces is measured, never declared.**
+`aios.buzz.capability` probes :8080 and :3632 and reads the real binpkg count, so
+announcing early would publish a node that offers nothing. Never hand-write an
+announcement — fix the measurement. It is safe to run repeatedly: the profile is a
+replaceable kind and the detail document is addressable, so three announces leave one
+of each rather than a pile.
+
+Two events go out. A **kind 0** profile, small and readable in any Nostr client, with
+the machine-readable block namespaced under `aios`; and a **kind 30078** document
+under `d=aios.capabilities` carrying the endpoints, the tree, and the lockfile digest a
+peer compares against its own to decide whether these binpkgs are reusable at all. The
+profile decides the verdict — a relay that refuses the document still lists the node,
+and `announce` says so rather than reporting failure.
+
+Everything is signed with `aios.bip340`, a from-scratch BIP-340 Schnorr implementation,
+because the target has no pip and `hashlib` is the only crypto in the stdlib. It passes
+all 19 official BIP-340 vectors including the ten forgeries, and that suite is on the
+release gate — a wrong signer produces signatures that verify against themselves, so
+nothing would complain until a relay refused every event this node ever sent. It is
+**not constant-time** and cannot be; the accepted reasoning is in the module docstring.
+
+Set `AIOS_BUZZ_URL` (the manifest points at `http://host.docker.internal:3000`, since a
+relay needs postgres, redis and object storage beside it and so runs on the host).
+`AIOS_BUZZ=0` at boot opts out. No relay is a normal case: init reports `not
+registered`, the agent's briefing says the network cannot see this node, and nothing
+fails — a node nobody has introduced yet still builds everything.
+
+**Two refusals worth recognising**, both measured against a real relay:
+
+- `403 relay_membership_required` — the relay runs closed
+  (`BUZZ_REQUIRE_RELAY_MEMBERSHIP=true`). It applies to reads as well as writes, and to
+  a node that had already announced; membership is a table, not a memory of past
+  activity. An operator admits a node with
+  `buzz-admin add-member --pubkey <64-hex>` and nothing else needs to change.
+- `restricted: unknown event kind` / `only accepted via WebSocket` — the HTTP bridge
+  takes a subset. From a brand-new pubkey with no channel and no membership, kinds
+  **0, 1, 3 and 30078** are accepted; 5 and 7 need an existing target, 9 needs an `h`
+  tag *and* channel membership, and 1059/20001 (DMs, presence) are WebSocket-only. So
+  there is no presence heartbeat available here — a heartbeat is a republished
+  announcement.
+
+To run one, `deploy/compose` in a block/buzz checkout brings up the published image
+with postgres, redis and MinIO beside it; `BUZZ_AUTO_MIGRATE=true` on a fresh database.
+It publishes on `0.0.0.0:3000`, which is what lets nodes on other machines reach it and
+also means the LAN can — writes still require a NIP-98 signature, but in open mode any
+key can make one.
+
 ## Generations
 
 The `#2` beside the machine name on the welcome screen counts the times this
