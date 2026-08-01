@@ -91,6 +91,35 @@ is the correct answer, nothing is installed yet.
 `forge build` without `--execute` is `emerge --pretend`; everything except `lower`
 runs offline. `forge --help` lists the rest — `init`, `show`, `reseal`, `minimize`.
 
+### Builds have no time limit
+
+A package takes tens of minutes; a toolchain takes hours. So a build is a *job* you
+start and poll, not a command you wait on — there is no timeout on it, not a long one,
+none:
+
+```bash
+id=$(forge build --detach --execute)     # returns at once, prints the job id
+python3 -m aios.build status $id         # running 2h 14m / exited 0 / exited 1
+python3 -m aios.build tail $id 40        # the end of its log
+python3 -m aios.build list               # every build this node knows about
+python3 -m aios.build stop $id           # kills emerge, its make, its compilers
+```
+
+The job is in its own session, so it survives your shell, `C-b d`, the terminal
+closing and the agent being replaced — and its exit status is written to disk by the
+job itself, so `status` still answers hours later when nothing is left to `waitpid` it.
+`--detach --pretend` is refused: a plan is something you read now.
+
+Three states, not two. `exited 0` and `exited 1` mean what they say; **`vanished` means
+the process is gone and recorded no status** — OOM-killed, or the pod was recreated
+under it. That is not a success, and nothing proved the build finished.
+
+The dashboard shows a running build with its elapsed time and its last log line, and a
+build is never `STUCK` or `IDLE` however quiet it is: a compile that prints nothing for
+twenty minutes is a compile. The agent uses the same mechanism through `build_start`,
+`build_status`, `build_tail` and `build_stop` — its `run_shell` still caps at an hour,
+because a timeout is the right thing for a command and the wrong thing for a build.
+
 ## Talking to the agent
 
 `aios` gives you the welcome screen and then the agent prompt. It is good at

@@ -329,10 +329,17 @@ class TestEnvelope(Base):
         self.assertIn('source="read_file"', out)
 
     def test_only_harness_authored_output_opts_out_of_the_envelope(self) -> None:
-        """A new tool is wrapped by default; opting out has to be deliberate."""
+        """A new tool is wrapped by default; opting out has to be deliberate.
+
+        `build_start` is the third, and it is the case that shows why the list is
+        enumerated rather than derived: its output is the instruction half of the
+        start/poll mechanism ("poll it with build_status, it has no time limit"), and an
+        instruction inside an envelope is covered by the never-obey rule and would be
+        correctly ignored. Everything of the model's it echoes goes through `quote`.
+        """
         self.assertEqual(
             {tool.name for tool in tools.ALL if not tool.untrusted},
-            {"write_file", "spawn_agent"},
+            {"write_file", "spawn_agent", "build_start"},
         )
 
     def test_a_file_full_of_markers_reaches_the_model_inert(self) -> None:

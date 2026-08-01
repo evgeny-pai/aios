@@ -23,18 +23,35 @@ implement it, which is why `portage.binhost_env` puts the token in the URL at al
 the two fetchers disagree, and the code that hands a URL to both cannot assume either.
 
 **Fix:** authenticate explicitly, and never let the URL carry the secret into a message.
+`forge.binpkg._credential` does exactly this:
 
 ```python
 parts = urllib.parse.urlsplit(url)
 if parts.username:
-    auth = base64.b64encode(f"{parts.username}:{parts.password or ''}".encode()).decode()
+    user, password = map(urllib.parse.unquote, (parts.username, parts.password or ""))
+    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
     request.add_unredirected_header("Authorization", f"Basic {auth}")
     url = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()
 ```
 
-Every error message built from that URL is prefixed with it, so redact before it is
-raised — `forge.portage.redact_url`. The DNS failure above put a live token on the
-terminal, which is the worse half of this bug.
+`unquote` because wget and curl decode the userinfo before spending it; skip it and
+the two fetchers authenticate as different users against one URL. `rpartition`
+because a password may contain `@`.
 
-**Verify:** `python3 -m unittest tests.test_binpkg.TestPeerCredential` — it dials a real
-server with a userinfo URL and asserts the token reaches neither stdout nor stderr.
+Two things that bite after it works:
+
+- **`add_unredirected_header` is dropped on every 3xx** — that is what "unredirected"
+  means, and it is the right default. A binhost that 302s `/binpkgs` to `/binpkgs/`
+  then answers 401. Re-attach it *after* an origin check, never before:
+  `_PinnedRedirect.redirect_request` compares `_origin(newurl)` to
+  `_origin(req.full_url)` (both userinfo-blind, since `urlsplit().hostname` strips it)
+  and only then puts the header back.
+- **Keep dialing and reporting separate.** Every error message is prefixed with the
+  URL, so the whole URL goes to `_shown`/`forge.portage.redact_url` and only the
+  stripped one reaches `Request`. The DNS failure above put a live token on the
+  terminal, which is the worse half of this bug.
+
+**Verify:** `python3 -m unittest tests.test_binpkg.TestPeerCredential
+tests.test_binpkg.TestPeerCredentialRedirect` — the fixture's binhost answers 401 to
+any request without the header, so every read that succeeds is proof the token
+reached the wire, and every test also asserts it reached neither stdout nor stderr.
