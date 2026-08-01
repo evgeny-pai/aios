@@ -2201,6 +2201,80 @@ class Keys(unittest.TestCase):
         self.assertIn("C-b ?", text)
         self.assertRegex(text, r"\d+ more")
 
+    def test_the_shell_pane_is_the_operator_and_only_the_shell_pane(self):
+        """Pane 1 drops to the minted account; the agent's panes must stay uid 0.
+
+        identity.py's docstring is the rule: the agent has to emerge packages, so
+        the session it runs in stays root — the operator account is for the human.
+        A `su` that leaked into RUN_PROMPT or RUN_DASH would demote the agent; a
+        shell pane without it would leave the human living as root with a sudoers
+        drop-in nobody uses.
+        """
+        login = container_file("aios-login")
+        self.assertIn('RUN_SHELL="exec bash -l"', login)
+        self.assertIn('RUN_SHELL="exec su - $AIOS_OPERATOR"', login)
+        # Guarded on the account resolving and su existing — a boot where useradd
+        # failed must land in a root shell, not a pane that dies at spawn.
+        guard = login.find('if id "$AIOS_OPERATOR"')
+        self.assertGreater(guard, 0)
+        self.assertIn("command -v su", login[guard : login.find("\n", guard)])
+        for segment in ("RUN_PROMPT=", "RUN_DASH="):
+            index = login.find(segment)
+            self.assertNotIn("su -", login[index : login.find("\n", index) + 1])
+
+    def test_the_shell_pane_is_respawned_by_id_after_the_layout(self):
+        """Live pane indices need not match creation order; the id names the pane."""
+        login = container_file("aios-login")
+        started = login.find('start "$SHELLPANE" "$RUN_SHELL"')
+        layout = max(login.find("split -h 38"), login.find("split -v 35"))
+        self.assertGreater(started, layout, "the shell must start after the layout is final")
+        self.assertNotIn('start "$WINDOW.1"', login, "panes are targeted by id, not index")
+
+    def test_boot_makes_the_operator_account_after_the_restore(self):
+        """aios-init creates the account each boot — it is all ephemeral layer.
+
+        After the binpkg restore on purpose: that is what brings the sudo binary
+        back, and the boot line reports whether the grant has its binary yet.
+        """
+        init = container_file("aios-init")
+        made = init.find("aios.identity --account")
+        self.assertGreater(made, init.find("--usepkgonly"))
+        self.assertLess(made, init.find("aios.generation bump"),
+                        "the account is part of the boot, not an afterthought")
+
+    def test_the_restore_survives_an_unsatisfiable_cached_atom(self):
+        """One masked binpkg on the cache must not zero the whole restore.
+
+        Seen live at boot #9: a ~arm64-masked x11vnc binpkg aborted the 425-atom
+        restore emerge in RESOLUTION — nothing installed, --keep-going never
+        applied because no build started — and the boot line still said ok. The
+        init script now reads the atom emerge names, drops it, retries, and a
+        restore that still did not complete says so instead of counting packages.
+        """
+        init = container_file("aios-init")
+        # emerge's own failure lines are the source of truth, and there are two
+        # shapes: the atom itself is unsatisfiable, or the atom is fine and its
+        # dependency chain is broken — then only the [argument] line names
+        # something that is actually on the command line.
+        self.assertIn('satisfy "', init)
+        self.assertIn('\\[argument\\]', init)
+        self.assertIn("restore did not complete", init)
+        self.assertIn("skipped", init)
+        # The third shape: the index lists a binary the directory no longer has
+        # (emaint --fix does not reliably prune it), and emerge dies at fetch.
+        self.assertIn("non-existent binary", init)
+        # And the fourth: a package that HANGS the unpack (a cached redis gpkg
+        # deadlocked zstd) — the emerge runs under a deadline, and 124 names the
+        # package emerge was on when the deadline hit.
+        self.assertIn("timeout -s INT", init)
+        self.assertIn('"$code" = 124', init)
+        self.assertIn("Emerging binary", init)
+        # The ok line is conditional now — it must not be the statement right
+        # after the emerge, unconditionally reached.
+        emerge_at = init.find("--usepkgonly --noreplace")
+        ok_at = init.find('step ok "packages"')
+        self.assertIn("if", init[emerge_at:ok_at])
+
     def test_the_manifest_is_one_key_away_from_the_prompt(self):
         """It is not printed in pane 0 any more, so it has to be reachable."""
         conf, login = container_file("tmux.conf"), container_file("aios-login")

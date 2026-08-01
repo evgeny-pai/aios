@@ -1,5 +1,5 @@
 {
-  "digest": "sha256:bba8e27b5c5f8fbd9a04f6afc3cdafd9f3e6a91a3dc27ac8b10d7f9d8dcae31f",
+  "digest": "sha256:ed4caa1b59d630b0abd572ba9aec4fde583ba3857d3f3ce1af0c4ebe66f712d4",
   "generated_by": {
     "model": "claude-opus-5",
     "provider": "anthropic"
@@ -40,6 +40,10 @@
         "distcc"
       ],
       "text": "when this machine is compiling something large and other machines on the network are offering spare capacity, hand them the individual compile jobs instead of doing all of them here; when nobody is offering, compile everything locally without treating that as a failure"
+    },
+    {
+      "probes": [],
+      "text": "work in the cockpit's shell as the named operator account rather than root, with passwordless escalation to root for administration; the agent session itself stays root"
     }
   ],
   "make_conf": [
@@ -113,9 +117,28 @@
     "tmux starting split into two panes is a tmux.conf/session-script matter, not a build decision.",
     "Serving the ebuild tree over HTTP additionally needs nginx's autoindex http module enabled via NGINX_MODULES_HTTP; that variable is not part of this schema.",
     "All listed packages build on musl/aarch64; none are known to be glibc-only. distcc's zeroconf support pulls net-dns/avahi, which is musl-compatible.",
-    "spec_digest re-stamped by hand for the [agent] provider change (anthropic -> fallback) without re-running the lowering. Which backend is ASKED NEXT time is not an input to any decision recorded here: the packages, USE flags and make.conf below were produced by claude-opus-5 and are unchanged, and generated_by still names it. Re-lowering to pick up a provider rename would have churned every USE decision for nothing, which is the opposite of a reviewable diff."
+    "spec_digest re-stamped by hand for the [agent] provider change (anthropic -> fallback) without re-running the lowering. Which backend is ASKED NEXT time is not an input to any decision recorded here: the packages, USE flags and make.conf below were produced by claude-opus-5 and are unchanged, and generated_by still names it. Re-lowering to pick up a provider rename would have churned every USE decision for nothing, which is the opposite of a reviewable diff.",
+    "app-admin/sudo added by hand for intent[7], with the spec_digest re-stamped, rather than by a re-lowering: lowering is nondeterministic and a full re-run churns every reviewed USE decision to add one package (this file already records one such overruling). The flags here match the binary the live node built and cached (sudo-1.9.17_p2 emerged with USE=-sendmail, global -pam), so boot-time restore reuses that binpkg instead of rebuilding."
   ],
   "packages": [
+    {
+      "accept_keywords": [],
+      "atom": "app-admin/sudo",
+      "probes": [],
+      "use": [
+        {
+          "enabled": false,
+          "flag": "pam",
+          "why": "intent[7]: escalation is passwordless by policy and this machine has no PAM stack anywhere (global USE -pam, init is dinit); sudo authenticates via NOPASSWD in /etc/sudoers.d/aios-operator, not via a module"
+        },
+        {
+          "enabled": false,
+          "flag": "sendmail",
+          "why": "intent[7]: sudo's default USE pulls mail-mta/nullmailer + app-admin/metalog + virtual/mta — six packages to email failed-sudo reports on a machine with no mail. Logging to syslog is untouched by this flag."
+        }
+      ],
+      "why": "intent[7]: the operator account works in the shell pane and escalates to root with sudo; the account and the sudoers drop-in are boot-time work in aios-init, the binary is this package"
+    },
     {
       "accept_keywords": [],
       "atom": "app-editors/vim",
@@ -384,7 +407,7 @@
     }
   ],
   "schema": 1,
-  "spec_digest": "sha256:cf3e756c78884fe8535c56d181f1ecffc6c0886b6f657b9fe99d8f7b0018ba06",
+  "spec_digest": "sha256:ccfc19df302fb58f6817f95ad09e8a0c6f0dbd78327a2f6203e9da5ce8cb1a7a",
   "system": {
     "arch": "aarch64",
     "cflags": "-O2 -pipe",

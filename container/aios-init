@@ -125,15 +125,106 @@ fi
 # FEATURE whose binary is not there yet.
 restore_atoms=$(python3 -m aios.repo cached-atoms 2>/dev/null || echo '')
 if [ "${AIOS_RESTORE:-1}" = 1 ] && [ -n "$restore_atoms" ]; then
-    # Word splitting is wanted here: the atoms are one emerge command line.
-    # shellcheck disable=SC2086
-    FEATURES="-ccache -distcc" emerge --usepkgonly --noreplace --keep-going \
-        --quiet --quiet-build=y $restore_atoms >/var/log/aios-restore.log 2>&1 || true
+    # One unsatisfiable atom must not zero the whole restore. emerge answers a
+    # masked or unresolvable member by aborting RESOLUTION — nothing installs at
+    # all, and --keep-going does not apply because no build ever started. This
+    # happened, twice in one cache: a ~arm64-masked x11vnc binpkg zeroed a boot's
+    # whole 425-atom restore while this step still said ok, and an xorg-drivers
+    # binpkg whose xorg-server[udev] dependency had no binary failed the retry the
+    # same way. So the failure emerge reports is read back — it names either the
+    # atom itself ('could satisfy "x"' / 'to satisfy "x"') or the argument whose
+    # dependency chain broke ('required by "x" [argument]') — the named atoms are
+    # dropped, and the rest get another try. Bounded, because a failure that names
+    # nothing (full disk, broken portage) would loop forever.
     have=$(echo "$restore_atoms" | wc -w | tr -d ' ')
+    : >/var/log/aios-restore.log
+    # The binpkg index and the directory can disagree — a hand-removed gpkg
+    # leaves an index entry emerge will happily plan and then die on ("Tried to
+    # use non-existent binary"). portage's own remedy, run first, best-effort.
+    emaint binhost --fix >>/var/log/aios-restore.log 2>&1 || true
+    restored=0 skipped=''
+    # Under a deadline, because a bad package can HANG rather than fail: a cached
+    # redis gpkg deadlocked portage's unpack (zstd waiting on a pipe nobody was
+    # reading) reproducibly, and a restore that never returns is a boot that never
+    # finishes. INT first so emerge can clean up its children. If coreutils'
+    # timeout is somehow absent, the restore runs bare rather than not at all.
+    deadline=''
+    command -v timeout >/dev/null 2>&1 &&
+        deadline="timeout -s INT -k 60 ${AIOS_RESTORE_TIMEOUT:-1800}"
+    for _try in 1 2 3 4 5; do
+        # Word splitting is wanted here: the atoms are one emerge command line,
+        # and $deadline is the timeout prefix or nothing.
+        # shellcheck disable=SC2086
+        FEATURES="-ccache -distcc" $deadline \
+            emerge --usepkgonly --noreplace --keep-going \
+            --quiet --quiet-build=y $restore_atoms >>/var/log/aios-restore.log 2>&1
+        code=$?
+        if [ "$code" = 0 ]; then
+            restored=1
+            break
+        fi
+        drop=$({
+            sed -n 's/.*satisfy "\([^"]*\)".*/\1/p' /var/log/aios-restore.log
+            sed -n 's/.*dependency required by "\([^"]*\)" \[argument\].*/\1/p' \
+                /var/log/aios-restore.log
+            # A stale index entry — the file is gone but Packages still lists it,
+            # and emaint --fix above does not always prune it. Names cat/pkg-ver,
+            # so split the version off the way portage spells it.
+            sed -n "s/.*non-existent binary for '\([^']*\)'.*/\1/p" \
+                /var/log/aios-restore.log |
+                sed 's/-r[0-9][0-9]*$//; s/-[0-9][^-]*$//'
+        } | sort -u)
+        if [ "$code" = 124 ]; then
+            # Killed by the deadline. The atom to drop is whatever emerge was on —
+            # the last "Emerging binary (N of M) cat/pkg-ver::repo" line, with the
+            # version split off the way portage spells it (-rN first, then -<v>).
+            hung=$(sed -n 's/.*Emerging binary ([^)]*) \([^ ]*\)::.*/\1/p' \
+                /var/log/aios-restore.log | tail -1 |
+                sed 's/-r[0-9][0-9]*$//; s/-[0-9][^-]*$//')
+            drop="$drop $hung"
+        fi
+        new=''
+        for atom in $drop; do
+            # The log accumulates across retries, so an atom already dropped shows
+            # up again here; only one still on the command line is progress.
+            case " $restore_atoms " in *" $atom "*) new="$new $atom" ;; *) continue ;; esac
+            # shellcheck disable=SC2086
+            restore_atoms=$(printf '%s\n' $restore_atoms | grep -vx "$atom" | tr '\n' ' ')
+        done
+        [ -n "$new" ] || break   # nothing nameable left to drop
+        skipped="$skipped$new"
+    done
     back=$(ls -d /var/db/pkg/*/* 2>/dev/null | wc -l | tr -d ' ')
-    step ok "packages" "$back installed, $have restorable from this node's own cache"
+    if [ "$restored" = 1 ] && [ -z "$skipped" ]; then
+        step ok "packages" "$back installed, $have restorable from this node's own cache"
+    elif [ "$restored" = 1 ]; then
+        step ok "packages" "$back installed; skipped$skipped (unsatisfiable — /var/log/aios-restore.log)"
+    else
+        note "packages" "restore did not complete — see /var/log/aios-restore.log"
+    fi
 else
     note "packages" "no binpkg cache yet — first build on this node compiles from source"
+fi
+
+# The operator account, made real at boot rather than at first login. Everything
+# it consists of — the /etc/passwd entry, /home, group wheel membership, the
+# /etc/sudoers.d/aios-operator drop-in — is the ephemeral layer, so a pod recreate
+# erases all of it while the handle itself survives on the state volume. Recreating
+# it here means the login path FINDS the account instead of racing to make it, and
+# the cockpit's shell pane can be a person with sudo instead of root. The agent
+# session stays uid 0 (identity.py is explicit: it has to emerge packages); this is
+# the other half, the human's half. After the restore on purpose: that is what puts
+# the sudo binary back, and a grant reported before its binary exists would be the
+# kind of claim this boot screen exists to not make.
+operator=$(python3 -m aios.identity --account 2>/dev/null || echo '')
+if [ -n "$operator" ] && id "$operator" >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+        step ok "operator" "$operator — wheel, passwordless sudo"
+    else
+        step ok "operator" "$operator — wheel; sudo not installed yet"
+    fi
+else
+    note "operator" "account not created — the shell pane will fall back to root"
 fi
 
 # Services this node offers the network, started here rather than by hand.

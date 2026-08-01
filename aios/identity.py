@@ -18,6 +18,7 @@ handle names *you*, not the privilege the session holds.
 
 from __future__ import annotations
 
+import grp
 import os
 import pwd
 import subprocess
@@ -77,20 +78,93 @@ def operator(root: Path | None = None, *, create_account: bool = False) -> str:
     return handle
 
 
+#: The group that carries administrative privilege, and the sudoers drop-in that
+#: grants it. The drop-in names the GROUP, not the handle, so it is one constant
+#: file on every node — the per-machine part (which handle is in wheel) lives in
+#: /etc/group where account state belongs.
+WHEEL = "wheel"
+SUDOERS = Path("/etc/sudoers.d/aios-operator")
+SUDOERS_TEXT = "%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n"
+SUDOERS_MODE = 0o440
+
+
 def ensure_account(handle: str) -> bool:
-    """Make the handle real in /etc/passwd. Best-effort and never fatal."""
+    """Make the handle real in /etc/passwd. Best-effort and never fatal.
+
+    Real means usable: the account is in `wheel` and the sudoers drop-in for that
+    group exists, so the operator can administer the machine without being root.
+    NOPASSWD because the account has no password to give — nothing on this machine
+    ever set one, and a prompt that can only be answered by ^C is worse than none.
+
+    All of it lives in the ephemeral layer (/etc/passwd, /home, /etc/sudoers.d), so
+    this runs at every boot and every login and converges rather than creates: an
+    account that already exists is joined to wheel if it is not there, and the
+    drop-in is rewritten only when its content or mode is wrong.
+
+    The agent session itself stays uid 0 — see the module docstring — this is for
+    the human in the cockpit's shell pane.
+    """
     try:
         pwd.getpwnam(handle)
-        return True
     except KeyError:
-        pass
+        try:
+            subprocess.run(
+                ["useradd", "--create-home", "--shell", "/bin/bash", handle],
+                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+    _join_wheel(handle)
+    _ensure_sudoers()
+    return True
+
+
+def _join_wheel(handle: str) -> bool:
+    """Membership of wheel, added exactly once. Best-effort."""
+    try:
+        if handle in grp.getgrnam(WHEEL).gr_mem:
+            return True
+    except KeyError:
+        return False  # a userland with no wheel group has no privilege to grant
     try:
         subprocess.run(
-            ["useradd", "--create-home", "--shell", "/bin/bash", handle],
+            ["usermod", "-aG", WHEEL, handle],
             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
             check=True,
         )
     except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _ensure_sudoers() -> bool:
+    """The drop-in that makes wheel mean something. Best-effort.
+
+    Written whether or not app-admin/sudo is installed yet: at boot the binary
+    comes back from the binpkg cache moments before this runs, and on a machine
+    that never installs sudo the file is inert. Mode 0440 because sudo refuses a
+    sudoers file that is writable or executable, and refusing loudly at every
+    `sudo` is the failure mode this avoids. The temp name contains a dot, which
+    sudoers.d skips by rule, so a crash mid-write can never leave a half-parsed
+    grant behind.
+    """
+    try:
+        st = SUDOERS.stat()
+        if (
+            (st.st_mode & 0o777) == SUDOERS_MODE
+            and SUDOERS.read_text(encoding="utf-8") == SUDOERS_TEXT
+        ):
+            return True
+    except OSError:
+        pass
+    try:
+        SUDOERS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SUDOERS.with_suffix(".new")
+        tmp.write_text(SUDOERS_TEXT, encoding="utf-8")
+        tmp.chmod(SUDOERS_MODE)
+        tmp.replace(SUDOERS)
+    except OSError:
         return False
     return True
 

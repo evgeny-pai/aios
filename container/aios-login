@@ -6,7 +6,8 @@
 # The cockpit: three panes in one window, and you land in the prompt.
 #
 #   0  left, top      the cockpit's keys, then the agent prompt
-#   1  left, bottom   a root shell, for watching a build
+#   1  left, bottom   the operator's shell (their own account, sudo for root
+#                     moments; plain root only if the account does not exist)
 #   2  right          the dashboard — every agent, what it is doing, and whether
 #                     anything is stuck (python3 -m aios.supervisor)
 #
@@ -125,6 +126,19 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     RUN_DASH="$RUN_DASH; printf '\n  dashboard stopped — restart: python3 -m aios.supervisor\n'"
     RUN_DASH="$RUN_DASH; exec bash -l"
 
+    # The shell pane is the operator's, not root's. The prompt and dashboard panes
+    # stay uid 0 — identity.py is explicit that the agent has to emerge packages —
+    # but the pane a human types commands into runs as the account this machine
+    # minted for them, with wheel + sudo for the moments that need root. `su -`
+    # rather than plain su, so it is the operator's own login environment and not
+    # root's with a borrowed uid. Guarded on the account resolving: boot creates it,
+    # but a boot where useradd failed must land in a root shell, not a pane that
+    # exits on a user su cannot find.
+    RUN_SHELL="exec bash -l"
+    if id "$AIOS_OPERATOR" >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
+        RUN_SHELL="exec su - $AIOS_OPERATOR"
+    fi
+
     # Every pane starts as a login shell and is respawned with its real command
     # afterwards, because a program started in a pane that is about to be split
     # measures the wrong terminal. Both of these read their own size: the cheat sheet
@@ -148,8 +162,11 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     # three titles on one pane and land the human in the shell instead of the prompt.
     : "${PROMPT:=$WINDOW.0}" "${SHELLPANE:=$WINDOW.1}" "${DASHBOARD:=$WINDOW.2}"
 
-    # The geometry is final from here. Pane 1 keeps the shell it was born with.
+    # The geometry is final from here. The shell pane is respawned like the others
+    # — by the id captured at creation, never by index, because indices are
+    # positional and a live session's need not match creation order.
     start "$DASHBOARD" "$RUN_DASH"
+    start "$SHELLPANE" "$RUN_SHELL"
     start "$PROMPT" "$RUN_PROMPT"
 
     tmux -f "$CONF" select-pane -t "$PROMPT" -T prompt

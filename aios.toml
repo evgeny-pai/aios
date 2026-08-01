@@ -75,3 +75,12 @@ probes = ["ccache"]
 [[intent]]
 text   = "when this machine is compiling something large and other machines on the network are offering spare capacity, hand them the individual compile jobs instead of doing all of them here; when nobody is offering, compile everything locally without treating that as a failure"
 probes = ["distcc"]
+
+# The account itself (useradd, wheel, the sudoers drop-in) is boot-time work in
+# aios-init/identity.py, not a package; what needs a package is the escalation
+# path. No mail on this machine: sudo's default USE would drag in a
+# nullmailer + metalog MTA chain — six packages — to email failed-sudo reports
+# to a mailbox that does not exist.
+[[intent]]
+text   = "work in the cockpit's shell as the named operator account rather than root, with passwordless escalation to root for administration; the agent session itself stays root"
+probes = []
