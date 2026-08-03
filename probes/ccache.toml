@@ -20,7 +20,31 @@ name = "a fresh cache reports zero hits"
 script = '''
 export CCACHE_DIR="$T/cache"
 ccache --zero-stats > /dev/null
-ccache --show-stats | grep -qiE 'hit|Hits'
+
+# --print-stats, NOT --show-stats. The human summary omits zero-valued rows on ccache
+# 4.x, so on a genuinely fresh cache it prints only the cache size and a grep for 'hit'
+# matches nothing — the check failed precisely when its own premise held, and it did so
+# on the one node whose cache is a persistent volume. Measured on 4.13.5: `--show-stats`
+# emits two lines, neither containing "hit".
+#
+# The machine-readable form always emits every counter including the zeros, so assert
+# the NUMBER rather than the wording — the wording is ccache's to change, the number is
+# the property this check is about.
+# Both numbers from one pass: the sum, and how many counters it came from. The count is
+# what stops the check being vacuous — a renamed or misspelled field would sum to zero
+# just as convincingly as an empty cache does, so "zero hits" only means anything once
+# at least one hit counter has actually been read.
+#
+# The field name is matched on awk's $1 rather than with a grep anchor: the line is
+# `direct_cache_hit<TAB>0`, so `grep -E 'cache_hit$'` matches nothing at all — which is
+# how the first attempt at this fix failed while looking correct.
+stats=$(ccache --print-stats |
+        awk '$1 ~ /cache_hit$/ { total += $2; seen += 1 } END { print total + 0, seen + 0 }')
+hits=${stats% *}
+seen=${stats#* }
+
+test "$seen" -gt 0
+test "$hits" -eq 0
 '''
 
 [[check]]
