@@ -216,7 +216,13 @@ fi
 # the other half, the human's half. After the restore on purpose: that is what puts
 # the sudo binary back, and a grant reported before its binary exists would be the
 # kind of claim this boot screen exists to not make.
-operator=$(python3 -m aios.identity --account 2>/dev/null || echo '')
+# stderr is KEPT, not sent to /dev/null. A boot reported "account not created" with no
+# way to learn more, and running the same call by hand afterwards succeeded — no error,
+# no repro, and a real regression left sitting in the boot path. The reason now travels
+# two ways: a traceback lands in operator_err, and identity.ensure_account records
+# useradd's own words to /var/log/aios-operator.log.
+operator_err=$(mktemp 2>/dev/null || echo /tmp/aios-operator.err)
+operator=$(python3 -m aios.identity --account 2>"$operator_err" || echo '')
 if [ -n "$operator" ] && id "$operator" >/dev/null 2>&1; then
     if command -v sudo >/dev/null 2>&1; then
         step ok "operator" "$operator — wheel, passwordless sudo"
@@ -224,8 +230,11 @@ if [ -n "$operator" ] && id "$operator" >/dev/null 2>&1; then
         step ok "operator" "$operator — wheel; sudo not installed yet"
     fi
 else
-    note "operator" "account not created — the shell pane will fall back to root"
+    why=$(python3 -m aios.identity --why 2>/dev/null || true)
+    [ -z "$why" ] && why=$(tail -1 "$operator_err" 2>/dev/null)
+    note "operator" "account not created — ${why:-no reason recorded}; shell pane falls back to root"
 fi
+rm -f "$operator_err" 2>/dev/null || true
 
 # Services this node offers the network, started here rather than by hand.
 #

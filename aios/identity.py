@@ -95,6 +95,38 @@ SUDOERS = Path("/etc/sudoers.d/aios-operator")
 SUDOERS_TEXT = "%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n"
 SUDOERS_MODE = 0o440
 
+#: Where a failure to create the operator records WHY.
+#:
+#: This exists because a boot reported `operator account not created — the shell pane
+#: will fall back to root` and there was no way to find out more: `useradd`'s stderr
+#: was inside a `capture_output=True` that the `except` discarded, and aios-init calls
+#: this through `2>/dev/null`. Everything about the step was best-effort, including its
+#: explanation, so a reproducible failure looked like an act of God — and running the
+#: same call by hand afterwards SUCCEEDED, which is the worst case: no error, no
+#: repro, and a real regression sitting in the boot path.
+#:
+#: Best-effort itself, deliberately. A machine that cannot write its log must still
+#: boot; it just boots less debuggably.
+ACCOUNT_LOG = Path("/var/log/aios-operator.log")
+
+
+def _note(reason: str) -> None:
+    try:
+        ACCOUNT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ACCOUNT_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(reason.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def account_failure() -> str:
+    """The last recorded reason the operator account could not be made, or ""."""
+    try:
+        lines = [ln for ln in ACCOUNT_LOG.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return ""
+    return lines[-1] if lines else ""
+
 
 def ensure_account(handle: str) -> bool:
     """Make the handle real in /etc/passwd. Best-effort and never fatal.
@@ -111,6 +143,10 @@ def ensure_account(handle: str) -> bool:
 
     The agent session itself stays uid 0 — see the module docstring — this is for
     the human in the cockpit's shell pane.
+
+    Failures are RECORDED to ACCOUNT_LOG rather than only returned, because "best
+    effort" was being read as "no explanation": the one caller runs under
+    `2>/dev/null`, so a false return value was the entire signal.
     """
     try:
         pwd.getpwnam(handle)
@@ -121,10 +157,22 @@ def ensure_account(handle: str) -> bool:
                 capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
                 check=True,
             )
-        except (OSError, subprocess.SubprocessError):
+        except subprocess.CalledProcessError as exc:
+            # useradd's own words. Its exit codes are documented but unmemorable (9 is
+            # "name already in use", 4 is "uid taken"), so the message matters more.
+            detail = (exc.stderr or exc.stdout or "").strip().replace("\n", "; ")
+            _note(f"useradd {handle} exited {exc.returncode}: {detail or 'no output'}")
             return False
-    _join_wheel(handle)
-    _ensure_sudoers()
+        except subprocess.TimeoutExpired:
+            _note(f"useradd {handle} timed out after 30s")
+            return False
+        except OSError as exc:
+            _note(f"useradd {handle} could not run: {exc}")
+            return False
+    if not _join_wheel(handle):
+        _note(f"{handle} exists but is not in {WHEEL}")
+    if not _ensure_sudoers():
+        _note(f"{SUDOERS} could not be written")
     return True
 
 
@@ -306,7 +354,14 @@ def greeting(handle: str, generation: int = 0) -> str:
 def main() -> int:
     import sys
 
-    handle = operator(create_account="--account" in sys.argv[1:])
+    args = sys.argv[1:]
+    if "--why" in args:
+        # For the boot script's failure branch: the recorded reason, or nothing.
+        reason = account_failure()
+        if reason:
+            print(reason)
+        return 0 if reason else 1
+    handle = operator(create_account="--account" in args)
     print(handle)
     return 0
 
