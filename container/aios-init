@@ -224,6 +224,26 @@ fi
 operator_err=$(mktemp 2>/dev/null || echo /tmp/aios-operator.err)
 operator=$(python3 -m aios.identity --account 2>"$operator_err" || echo '')
 if [ -n "$operator" ] && id "$operator" >/dev/null 2>&1; then
+    # Put the node's name in the operator's prompt too.
+    #
+    # /etc/profile.d already sets a PS1 carrying $AIOS_HOSTNAME, but `su -` gives a login
+    # shell that sources profile.d FIRST and the skeleton ~/.bashrc AFTER, and that file
+    # sets its own `\u@\h` prompt — where \h is the KERNEL hostname, which stays `aios`
+    # because sethostname(2) needs CAP_SYS_ADMIN. So the operator's shell was the one
+    # place still reading `aios`, which is exactly the signal that makes a current node
+    # look like it is running old code.
+    #
+    # Appended last, marker-guarded so repeated boots converge instead of accumulating,
+    # and it reads $AIOS_HOSTNAME at prompt-expansion time rather than baking the name —
+    # the generation changes on every boot and the home directory may outlive it.
+    home=$(getent passwd "$operator" 2>/dev/null | cut -d: -f6)
+    if [ -n "$home" ] && [ -d "$home" ] && ! grep -q 'aios-hostname-prompt' "$home/.bashrc" 2>/dev/null; then
+        {
+            printf '\n# aios-hostname-prompt: last word on PS1, after the skeleton bashrc\n'
+            printf 'PS1='"'"'\\[\\033[38;5;117m\\]${AIOS_HOSTNAME:-\\h}\\[\\033[2m\\]:\\w\\[\\033[0m\\] \\$ '"'"'\n'
+        } >> "$home/.bashrc" 2>/dev/null || true
+        chown "$operator" "$home/.bashrc" 2>/dev/null || true
+    fi
     if command -v sudo >/dev/null 2>&1; then
         step ok "operator" "$operator — wheel, passwordless sudo"
     else
@@ -379,10 +399,14 @@ nodehost=$(py 'from aios import identity; print(identity.hostname())')
 if [ -n "$nodehost" ]; then
     hostname "$nodehost" 2>/dev/null || true
     export AIOS_HOSTNAME="$nodehost"
-    {
-        printf 'export AIOS_HOSTNAME=%s\n' "$nodehost"
-        printf "PS1='\\[\\033[38;5;117m\\]%s\\[\\033[2m\\]:\\w\\[\\033[0m\\] \\$ '\\n" "$nodehost"
-    } > /etc/profile.d/aios-hostname.sh 2>/dev/null || true
+    # The export ONLY — no PS1 here. This file used to define one, and because it sorts
+    # before /etc/profile.d/aios.sh ('-' is 0x2D, '.' is 0x2E) the image's plain `aios`
+    # prompt was sourced afterwards and won every time: the variable was right, the
+    # prompt was wrong, and the cockpit looked like it was running old code. aios.sh now
+    # interpolates ${AIOS_HOSTNAME:-aios}, so exporting it first is exactly what is
+    # needed and there is one prompt definition instead of two.
+    printf 'export AIOS_HOSTNAME=%s\n' "$nodehost" \
+        > /etc/profile.d/aios-hostname.sh 2>/dev/null || true
     if [ "$(hostname 2>/dev/null)" = "$nodehost" ]; then
         step ok "hostname" "$nodehost"
     else

@@ -68,10 +68,22 @@ RUN chmod +x /sbin/aios-init /sbin/aios-login /usr/local/bin/manual /usr/local/b
 
 # A prompt that matches the rest of the machine, for when you want a plain shell
 # instead of the agent.
+#
+# The name comes from $AIOS_HOSTNAME rather than being hard-coded, and this is the ONLY
+# place a PS1 is defined. aios-init used to write a second one to
+# /etc/profile.d/aios-hostname.sh, and that file sorts BEFORE this one ('-' is 0x2D,
+# '.' is 0x2E), so this line silently won the race and every cockpit showed `aios`
+# while the machine was called aios-10-mason-be8a. Two definitions of one prompt is
+# the defect; interpolating the variable the earlier file exports is the fix, and the
+# sort order now works in our favour. An unnamed machine still reads `aios`.
+#
+# Single-quoted here on purpose: ${AIOS_HOSTNAME:-aios} must reach the file unexpanded
+# rather than being resolved to `aios` at image build time. And `\\$` so the value ends
+# up as `\$`, which is what makes the prompt show `#` for root and `$` for the operator.
 RUN printf '%s\n' \
     'export PYTHONPATH=/aios' \
     'export PATH="/usr/local/bin:$PATH"' \
-    "PS1='\\[\\033[38;5;117m\\]aios\\[\\033[2m\\]:\\w\\[\\033[0m\\] \\$ '" \
+    'PS1="\[\033[38;5;117m\]${AIOS_HOSTNAME:-aios}\[\033[2m\]:\w\[\033[0m\] \\$ "' \
     'alias forge="python3 -m forge"' \
     > /etc/profile.d/aios.sh
 
