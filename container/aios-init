@@ -329,6 +329,27 @@ else
     note "self-update" "AIOS_GIT_REMOTE not set — this node will not update itself"
 fi
 
+# The generation is earned, not assumed: only a boot whose required checks all
+# passed counts as this machine having come up again.
+#
+# Counted HERE, above the announcement, and that ordering is the fix to a real bug: the
+# buzz announce reads identity.hostname(), which reads the counter, so announcing first
+# published every node one generation behind itself — a node that had just booted as
+# #12 introduced itself to the whole mesh as aios-11, and kind 0 is replaceable, so
+# that understatement stood until the next boot. The relay's view of which incarnation a
+# peer is running is exactly the thing generations exist to make legible.
+#
+# Safe to move: every check that can cost the boot its generation (`step warn`, which
+# increments ical) runs in the userland section far above this point — the services,
+# the announcement and the naming below are all reported with `note` when they fail,
+# because a node with no relay is still a working node.
+if [ "$ical" -eq 0 ]; then
+    gen=$(python3 -m aios.generation bump 2>/dev/null || echo '')
+    [ -n "$gen" ] && step ok "generation" "#$gen"
+else
+    note "generation" "not counted — $ical required check(s) failed"
+fi
+
 # Register on the buzz relay, if there is one.
 #
 # ORDERING IS LOAD-BEARING and this block must stay below the two above it. What a
@@ -373,15 +394,6 @@ if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
     step ok "ai provider" "${AIOS_MODEL:-claude-haiku-4-5-20251001}"
 else
     note "ai provider" "no credentials — agent will run degraded"
-fi
-
-# The generation is earned, not assumed: only a boot whose required checks all
-# passed counts as this machine having come up again.
-if [ "$ical" -eq 0 ]; then
-    gen=$(python3 -m aios.generation bump 2>/dev/null || echo '')
-    [ -n "$gen" ] && step ok "generation" "#$gen"
-else
-    note "generation" "not counted — $ical required check(s) failed"
 fi
 
 # Name this incarnation: aios-<generation>-<the name the machine minted for itself>.
@@ -431,4 +443,16 @@ if [ -t 0 ]; then
     printf '\n%s  agent session ended. reattach with: kubectl exec -it aios -- aios%s\n' "$DIM" "$OFF"
 fi
 
-exec tail -f /dev/null
+# Hand PID 1 to the reaper.
+#
+# This was `exec tail -f /dev/null`, which never calls wait(). Every orphan on this
+# machine — a build killed mid-run, a backgrounded responder whose parent exited, the
+# subshells started above — is reparented here and became a permanent zombie: a
+# process-table entry with a valid PID that `kill -0` and `ps` both report as alive. It
+# is also why a wait-for-death check could never pass in the pod, and why uptime
+# accumulated zombies with nothing ever visibly failing (skills/pid1-does-not-reap-orphans).
+#
+# aios.reaper also handles SIGTERM, which `tail` could not: PID 1 is exempt from the
+# DEFAULT action of every signal, so an unhandled TERM was ignored outright and each
+# `kubectl delete pod` waited out terminationGracePeriodSeconds before SIGKILL.
+exec python3 -m aios.reaper
