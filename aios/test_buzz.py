@@ -436,6 +436,29 @@ class TestAuthHeader(unittest.TestCase):
         self.assertEqual(buzz._auth_url("http://user:tok@h:3000", "/events"),
                          "http://h:3000/events")
 
+    def test_the_presented_authority_can_differ_from_the_dialled_one(self):
+        """buzz resolves the community from the Host header and 404s on a name it does
+        not know. A pod dials host.docker.internal and must present the relay's own
+        name, or it is told `no community is configured for this host`."""
+        with mock.patch.dict(os.environ, {buzz.HOST_ENV: "127.0.0.1:3000"}):
+            header = self.header_event(
+                buzz.auth_header("POST", "http://host.docker.internal:3000", "/events",
+                                 b"{}", key=KEY, created_at=1700000000)
+            )
+        tags = {t[0]: t[1] for t in header["tags"]}
+        self.assertEqual(tags["u"], "http://127.0.0.1:3000/events",
+                         "the signed u tag must match the PRESENTED host, not the dialled one")
+
+    def test_without_an_override_the_dialled_host_is_signed(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(buzz.HOST_ENV, None)
+            header = self.header_event(
+                buzz.auth_header("POST", "http://host.docker.internal:3000", "/events",
+                                 b"{}", key=KEY, created_at=1700000000)
+            )
+        tags = {t[0]: t[1] for t in header["tags"]}
+        self.assertEqual(tags["u"], "http://host.docker.internal:3000/events")
+
     def test_no_payload_tag_when_there_is_no_body(self):
         header = self.header_event(
             buzz.auth_header("GET", "http://r:3000", "/info", None, key=KEY,
@@ -626,6 +649,22 @@ class TestTransport(unittest.TestCase):
                     tags = {t[0]: t[1] for t in event.tags}
                     self.assertEqual(tags["u"], f"{url}{call['path']}")
                     self.assertEqual(tags["method"], "POST")
+
+    def test_an_override_sets_the_host_header_on_the_wire(self):
+        with scratch_root():
+            with stub_relay() as (url, calls):
+                with mock.patch.dict(os.environ, {buzz.HOST_ENV: "relay.example:3000"}):
+                    buzz.publish(buzz.build(1, "hi", key=KEY), url=url)
+            # urllib would otherwise derive Host from the URL it dialled.
+            self.assertEqual(calls[0]["headers"]["Host"], "relay.example:3000")
+
+    def test_no_host_header_is_forced_when_there_is_no_override(self):
+        with scratch_root():
+            with stub_relay() as (url, calls):
+                os.environ.pop(buzz.HOST_ENV, None)
+                buzz.publish(buzz.build(1, "hi", key=KEY), url=url)
+            host = calls[0]["headers"].get("Host", "")
+            self.assertIn("127.0.0.1", host, "should be the dialled authority")
 
     def test_info_is_not_authorised(self):
         """The relay describing itself needs no identity, and asking for one would

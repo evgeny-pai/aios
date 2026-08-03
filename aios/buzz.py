@@ -56,6 +56,34 @@ from . import identity
 
 URL_ENV = "AIOS_BUZZ_URL"
 
+#: The authority to PRESENT, when it differs from the one dialled.
+#:
+#: buzz resolves which community a request belongs to from the HTTP Host header
+#: (`bind_community`), and it fails closed on a host it does not know:
+#:
+#:     404 relay: no community is configured for this host
+#:
+#: That is exactly what a pod gets. The relay runs on the host machine and knows
+#: itself by the name it was configured with (say `127.0.0.1:3000`), while the only
+#: route a pod has to it is `host.docker.internal:3000` — so the name that works and
+#: the name that routes are different, which is ordinary virtual hosting.
+#:
+#: Setting this makes the client DIAL AIOS_BUZZ_URL and present (and sign) this
+#: authority instead. It has to be both: the relay builds the NIP-98 `u` tag it
+#: expects from the same Host header, so signing the dialled name against a presented
+#: name would swap a 404 for an equally opaque 401.
+#:
+#: THIS VALUE NAMES THE COMMUNITY, NOT THE ROUTE, and that is why an override is the
+#: right mechanism rather than teaching the relay a second name. Each row in the
+#: relay's `communities` table is a separate TENANT: profiles, notes and DMs are
+#: global only inside the community they were published to. Adding
+#: `host.docker.internal:3000` beside `127.0.0.1:3000` would therefore not admit the
+#: pod to the network — it would put the pod in a network of its own, unable to see or
+#: be seen by any node that arrived by the other name, which is a far more confusing
+#: failure than a 404. So every node in one mesh must present the SAME authority no
+#: matter which route it takes to get there.
+HOST_ENV = "AIOS_BUZZ_HOST"
+
 #: Same shape and same reasoning as aios.mesh.DEFAULT_URL: the relay runs on the
 #: HOST, not in the cluster, and `host.docker.internal` is the only route a pod has
 #: to it. On a laptop, set AIOS_BUZZ_URL=http://127.0.0.1:3000.
@@ -461,6 +489,26 @@ def build(
 AUTH_WINDOW_S = 60
 
 
+def _authority_of(url: str) -> str:
+    """The `host[:port]` actually dialled, ignoring any override."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return host
+
+
+def _authority(url: str) -> str:
+    """The `host[:port]` this request should claim to be for.
+
+    AIOS_BUZZ_HOST wins when set, because the relay keys both its community lookup
+    and its NIP-98 expectation off the Host header — see HOST_ENV. Userinfo never
+    survives: a Host header carries no credentials, and neither does a signed `u` tag.
+    """
+    override = (os.environ.get(HOST_ENV) or "").strip()
+    return override or _authority_of(url)
+
+
 def _auth_url(url: str, path: str) -> str:
     """The `u` tag value for a request to `url + path`.
 
@@ -470,11 +518,7 @@ def _auth_url(url: str, path: str) -> str:
     dial is used, which agrees for every deployment where the client talks to the
     relay the same way the world does.
     """
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    return f"{parts.scheme}://{host}{path}"
+    return f"{urlsplit(url).scheme}://{_authority(url)}{path}"
 
 
 def auth_header(
@@ -558,6 +602,12 @@ def _request(
     headers = {"Accept": accept, "User-Agent": "aios-buzz/1"}
     if body is not None:
         headers["Content-Type"] = "application/json"
+    # Present the authority the relay knows itself by, which is not always the one we
+    # dialled. urllib would otherwise derive Host from the URL, and the relay would
+    # answer 404 for a community it does have.
+    authority = _authority(url)
+    if authority and authority != _authority_of(url):
+        headers["Host"] = authority
     if authorise:
         headers["Authorization"] = auth_header(method, url, path, body, key=key)
 

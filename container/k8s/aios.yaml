@@ -199,8 +199,11 @@ spec:
           value: http://host.docker.internal:4748
         # The buzz relay this node registers on, announces its capabilities to, and
         # asks questions of. Same category as AIOS_MESH_URL above — topology, not a
-        # credential — and the same route, because a relay runs on the HOST (it needs
-        # postgres, redis and object storage beside it) while this is a pod.
+        # credential — but NOT the same route: there is ONE relay for the whole mesh
+        # (on dazlminim424, the always-on mini), so this is its LAN name. A per-host
+        # route like host.docker.internal would send each machine's pod to its own
+        # host — a machine that happens to run a relay would form a network of one,
+        # and a machine that does not would reach nothing.
         #
         # A URL pointing at nothing is harmless and deliberate: aios-init reports "not
         # registered" and boots normally, so this can be set before a relay exists.
@@ -208,7 +211,22 @@ spec:
         # a secret in a manifest is destroyed by the next `apply`
         # (see the aios-agent note at the top of this file).
         - name: AIOS_BUZZ_URL
-          value: http://host.docker.internal:3000
+          value: http://dazlminim424.local:3000
+        # The authority to PRESENT, which is not the one dialled above.
+        #
+        # buzz resolves the community from the HTTP Host header and fails closed on a
+        # name it does not know — a pod announcing itself got
+        # `404 relay: no community is configured for this host`, because the relay
+        # knows itself as 127.0.0.1:3000 while host.docker.internal is merely the only
+        # route a pod has to it.
+        #
+        # This must be the SAME value on every node in the mesh, because it names the
+        # community rather than the route: each row in the relay's `communities` table
+        # is a separate tenant, so a node presenting a different name would be alone in
+        # a network of one instead of joining this one. Change it only together with
+        # the relay's own configured host.
+        - name: AIOS_BUZZ_HOST
+          value: 127.0.0.1:3000
         # Where the LOCAL model lives, for the spec's `fallback` provider chain.
         #
         # Not an AIOS_PROVIDER/AIOS_MODEL override — those are still deliberately absent
