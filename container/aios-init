@@ -329,6 +329,28 @@ else
     note "self-update" "AIOS_GIT_REMOTE not set — this node will not update itself"
 fi
 
+# Skills mesh: push this node's skills/*/SKILL.md to ConductorAI, autonomously,
+# same shape as the self-update loop just above — one short-lived invocation per
+# tick rather than a long-running Python process. aios.skills.push() never raises
+# and never blocks past its own timeout, so a daemon that is down or slow costs
+# this loop nothing and the next tick tries again.
+#
+# No AIOS_GIT_REMOTE-style gate: unlike self-update, there is no "off" case worth
+# naming separately — a mesh that is not there is already this loop's normal
+# result (mesh.endpoint() always resolves to something, reachable or not), and
+# aios.skills.push logs its own one-line outcome either way.
+if [ "${AIOS_SKILLS_PUSH:-1}" = 1 ]; then
+    (
+        while :; do
+            python3 -m aios.skills push >>/var/log/aios-skills.log 2>&1 || true
+            sleep "${AIOS_SKILLS_PUSH_INTERVAL:-300}"
+        done
+    ) &
+    step ok "skills mesh" "pushing skills/ to ConductorAI every ${AIOS_SKILLS_PUSH_INTERVAL:-300}s"
+else
+    note "skills mesh" "AIOS_SKILLS_PUSH=0 — this node keeps its skills to itself"
+fi
+
 # The generation is earned, not assumed: only a boot whose required checks all
 # passed counts as this machine having come up again.
 #

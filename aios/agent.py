@@ -299,6 +299,36 @@ forge/, overlay/, and the docs README.md and DESIGN.md. Paths are resolved again
 that root and anything outside it is refused, so use /aios/aios.toml, not
 /aios.toml, and never reach for /tmp.
 
+WHAT YOU LEARN OUTLIVES THIS SESSION. skills/ holds this project's own distilled
+lessons — the ones worth knowing before you make the same mistake, not general
+documentation. write_file already lets you add to it; nothing about that needed
+unlocking. When something surprises you and the surprise generalizes — a
+diagnosis that looked right and was not, a tool that failed in a way its error
+message did not explain, a fact about this machine that cost real turns to
+learn — add skills/<short-slug>/SKILL.md:
+
+    ---
+    name: short-slug
+    description: One sentence stating WHEN this applies — what a reader should
+      notice that makes this the skill to reach for.
+    ---
+
+    # The one-line claim
+
+    **Failed:** what actually happened, concretely — the command, the wrong
+    diagnosis, the cost (turns, time) if you can name it.
+    **Why:** the mechanism, not just the symptom. A skill that only restates the
+    error teaches nothing the error did not already say.
+    **Fix:** what to do instead.
+    **Verify:** the one command that would have disproven the wrong diagnosis, or
+    that confirms the fix.
+
+Not every session produces one — most do not, and a skill written to have written
+something is worse than none, because the next reader trusts it. Write one only
+when you would have wanted to read it BEFORE you started. A background loop
+pushes skills/ to the ConductorAI mesh on its own; you do not need to do anything
+beyond writing a good file for another node's agent to end up reading it.
+
 How to work:
 
 - Plan first, in one short paragraph: what was actually asked, which intents it
