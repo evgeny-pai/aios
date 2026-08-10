@@ -82,7 +82,7 @@ cluster:
 ```bash
 container/build.sh
 ./auto-update.sh install              # optional: keep this host checkout + node current
-                                      # auto-update tests v2
+                                      # auto-update tests v3 (SSH key auth confirmed working)
 ```
 
 That builds the image, loads it into the `aios` cluster, applies the manifests,
