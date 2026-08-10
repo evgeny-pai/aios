@@ -72,7 +72,8 @@ MANIFEST = "latest.json"
 #:   therefore left alone. #2 had written AESTHETIC.md, CLI.md, QUICKSTART.md and
 #:   showcase.sh; an update is not entitled to destroy a machine's own work.
 PAYLOAD = ("aios", "forge", "probes", "tests", "overlay", "skills", "container",
-           "aios.toml", "aios.lock.json", "README.md", "DESIGN.md", "MANUAL.md")
+           "aios.toml", "aios.lock.json", "opencode.json",
+           "README.md", "DESIGN.md", "MANUAL.md")
 
 #: Files that must land OUTSIDE /aios to have any effect, copied from the payload's
 #: `container/` after a successful swap: source -> destination, mode.

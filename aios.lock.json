@@ -1,5 +1,5 @@
 {
-  "digest": "sha256:ed4caa1b59d630b0abd572ba9aec4fde583ba3857d3f3ce1af0c4ebe66f712d4",
+  "digest": "sha256:2ec99f2690c023853ba0eaedda7e143756591e738e14f1756661adf4b43249d0",
   "generated_by": {
     "model": "claude-opus-5",
     "provider": "anthropic"
@@ -44,6 +44,12 @@
     {
       "probes": [],
       "text": "work in the cockpit's shell as the named operator account rather than root, with passwordless escalation to root for administration; the agent session itself stays root"
+    },
+    {
+      "probes": [
+        "opencode"
+      ],
+      "text": "write and edit code from the shell using a terminal AI coding agent, backed by the local model by default and an optional hosted free tier"
     }
   ],
   "make_conf": [
@@ -118,7 +124,8 @@
     "Serving the ebuild tree over HTTP additionally needs nginx's autoindex http module enabled via NGINX_MODULES_HTTP; that variable is not part of this schema.",
     "All listed packages build on musl/aarch64; none are known to be glibc-only. distcc's zeroconf support pulls net-dns/avahi, which is musl-compatible.",
     "spec_digest re-stamped by hand for the [agent] provider change (anthropic -> fallback) without re-running the lowering. Which backend is ASKED NEXT time is not an input to any decision recorded here: the packages, USE flags and make.conf below were produced by claude-opus-5 and are unchanged, and generated_by still names it. Re-lowering to pick up a provider rename would have churned every USE decision for nothing, which is the opposite of a reviewable diff.",
-    "app-admin/sudo added by hand for intent[7], with the spec_digest re-stamped, rather than by a re-lowering: lowering is nondeterministic and a full re-run churns every reviewed USE decision to add one package (this file already records one such overruling). The flags here match the binary the live node built and cached (sudo-1.9.17_p2 emerged with USE=-sendmail, global -pam), so boot-time restore reuses that binpkg instead of rebuilding."
+    "app-admin/sudo added by hand for intent[7], with the spec_digest re-stamped, rather than by a re-lowering: lowering is nondeterministic and a full re-run churns every reviewed USE decision to add one package (this file already records one such overruling). The flags here match the binary the live node built and cached (sudo-1.9.17_p2 emerged with USE=-sendmail, global -pam), so boot-time restore reuses that binpkg instead of rebuilding.",
+    "app-misc/opencode added by hand for intent[8], with the spec_digest re-stamped, rather than by a re-lowering: this is a prebuilt-binary ebuild forged directly into overlay/app-misc/opencode/ (the project's first ebuild ever shipped from that overlay), fetching opencode's musl/arm64 release asset — no model call decided a USE flag because there are none to decide. accept_keywords carries ~arm64 because the ebuild has not been reviewed to stable."
   ],
   "packages": [
     {
@@ -193,6 +200,17 @@
         }
       ],
       "why": "intent[0]: edit code over ssh"
+    },
+    {
+      "accept_keywords": [
+        "~arm64"
+      ],
+      "atom": "app-misc/opencode",
+      "probes": [
+        "opencode"
+      ],
+      "use": [],
+      "why": "intent[8]: write and edit code from the shell; prebuilt binary ebuild forged into overlay/, no USE levers to decide"
     },
     {
       "accept_keywords": [],
@@ -407,7 +425,7 @@
     }
   ],
   "schema": 1,
-  "spec_digest": "sha256:ccfc19df302fb58f6817f95ad09e8a0c6f0dbd78327a2f6203e9da5ce8cb1a7a",
+  "spec_digest": "sha256:ad8c9df37862a7fb1d05c268e62f4e1fdadb0ff39e6c826dbd42666df33a3b72",
   "system": {
     "arch": "aarch64",
     "cflags": "-O2 -pipe",

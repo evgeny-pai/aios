@@ -1,0 +1,22 @@
+name        = "opencode"
+description = "The terminal coding agent is installed and can report a version."
+atoms       = ["app-misc/opencode"]
+
+# Each check runs under `bash -e` in a scratch dir exported as $T.
+# Deliberately NOT probing Ollama/Zen reachability: whether a model endpoint
+# answers right now is a fact about the moment, not the machine, and a flaky
+# probe reads worse to the minimizer than no probe at all.
+
+[[check]]
+name = "opencode is installed and reports a version"
+script = '''
+command -v opencode
+opencode --version | grep -qE '[0-9]+\.[0-9]+'
+'''
+
+[[check]]
+name = "project config is present and valid JSON"
+script = '''
+test -f /aios/opencode.json
+python3 -c "import json; json.load(open('/aios/opencode.json'))"
+'''

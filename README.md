@@ -104,6 +104,38 @@ kubectl -n aios delete pod aios && kubectl apply -f container/k8s/aios.yaml
 
 Without them the machine still boots and everything except lowering works.
 
+## Writing code from the shell: opencode
+
+`app-misc/opencode` (forged into `overlay/`) puts the
+[opencode](https://opencode.ai) terminal coding agent on every node, configured
+by the repo-root `opencode.json` to talk to the host's Ollama daemon by
+default — free, no account, already reachable from every pod as
+`OLLAMA_HOST`/`AIOS_OLLAMA_MODEL` in `container/k8s/aios.yaml`.
+
+An [OpenCode Zen](https://opencode.ai/zen) free-tier model is available as a
+switchable alternative once you create your own Zen account (account
+creation and any billing step are yours to do — nothing here automates
+that) and add the resulting key to the **same** `aios-agent` secret used
+above:
+
+```bash
+kubectl -n aios create secret generic aios-agent \
+  --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
+  --from-literal=OPENCODE_API_KEY=... --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n aios delete pod aios && kubectl apply -f container/k8s/aios.yaml
+```
+
+Two things to know before running that:
+
+- `kubectl create secret ... --dry-run | kubectl apply` **replaces the whole
+  secret** — every key not listed in the command is deleted, so
+  `ANTHROPIC_API_KEY` must be re-supplied alongside `OPENCODE_API_KEY` or it's
+  destroyed.
+- Do **not** use opencode's own `/connect` flow to store the Zen key — it
+  writes to a path under root's `$HOME`, which is not a persisted volume on
+  this machine and is lost on the next pod recreate. The secret above, wired
+  in via the pod's existing `envFrom`, is the only durable path.
+
 ## Layout
 
 | Path | What |

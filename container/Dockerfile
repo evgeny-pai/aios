@@ -28,7 +28,7 @@ WORKDIR /aios
 COPY forge/ /aios/forge/
 COPY probes/ /aios/probes/
 COPY overlay/ /aios/overlay/
-COPY aios.toml aios.lock.json /aios/
+COPY aios.toml aios.lock.json opencode.json /aios/
 
 # The machine ships its own tests, design docs and skills. This is not padding:
 # an AIos node is expected to rebuild itself, so the agent living inside it needs

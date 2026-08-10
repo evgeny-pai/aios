@@ -84,3 +84,7 @@ probes = ["distcc"]
 [[intent]]
 text   = "work in the cockpit's shell as the named operator account rather than root, with passwordless escalation to root for administration; the agent session itself stays root"
 probes = []
+
+[[intent]]
+text   = "write and edit code from the shell using a terminal AI coding agent, backed by the local model by default and an optional hosted free tier"
+probes = ["opencode"]
