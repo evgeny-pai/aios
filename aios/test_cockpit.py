@@ -1045,8 +1045,8 @@ class Rendering(unittest.TestCase):
             with env(NO_COLOR=None, TERM="xterm-256color", COLORTERM="truecolor"):
                 state = read(entry)
                 out = dashboard.watch_lines(state, 60, 24, glyphs=welcome.UNICODE)
+                rendered = dashboard.frame(out)
                 status = dashboard.status_line(state)
-        rendered = dashboard.frame(out)
         self.assertIn("PWNED", bare(rendered))  # it is evidence: kept as text
         self.assertEqual(rendered.count("\x1b[H"), 1)  # only the redraw's own home
         for surface in (rendered, status):

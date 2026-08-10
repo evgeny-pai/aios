@@ -25,6 +25,51 @@ mkdir -p "$HOME/.aios"
 ts() { date "+%Y-%m-%d %H:%M:%S"; }
 log() { echo "$(ts) $*" >>"$LOG"; }
 
+if [ "${1:-}" = "install" ]; then
+  if ! command -v launchctl >/dev/null; then
+    echo "ERROR: launchctl not found; the host updater is a macOS LaunchAgent" >&2
+    exit 1
+  fi
+  UID_N=$(id -u)
+  PLIST="$HOME/Library/LaunchAgents/dev.aios.update.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  chmod +x "$PWD/auto-update.sh" 2>/dev/null || true
+  TMP_PLIST="$PLIST.incoming"
+  cat > "$TMP_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.aios.update</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PWD/auto-update.sh</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$HOME/.aios/update.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.aios/update.log</string>
+</dict>
+</plist>
+PLIST
+  if [ ! -f "$PLIST" ] || ! cmp -s "$TMP_PLIST" "$PLIST"; then
+    mv "$TMP_PLIST" "$PLIST"
+    launchctl bootout "gui/$UID_N/dev.aios.update" 2>/dev/null || true
+    sleep 1
+    launchctl bootstrap "gui/$UID_N" "$PLIST" || true
+    echo "AIOS auto-update enabled (checks origin/main every 5 min)"
+  else
+    rm -f "$TMP_PLIST"
+    if ! launchctl print "gui/$UID_N/dev.aios.update" >/dev/null 2>&1; then
+      launchctl bootstrap "gui/$UID_N" "$PLIST" || true
+      echo "AIOS auto-update started"
+    else
+      echo "AIOS auto-update already enabled"
+    fi
+  fi
+  exit 0
+fi
+
 CONTEXT="${AIOS_KUBE_CONTEXT:-kind-aios}"
 NS="${AIOS_NAMESPACE:-aios}"
 DB="$HOME/.conductorai/conductorai.db"
