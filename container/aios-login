@@ -113,6 +113,35 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     WINDOW="$SESSION:machine"
 
     if tmux -f "$CONF" has-session -t "$SESSION" 2>/dev/null; then
+        # A session outlives the account it was created with — aios-init mints the
+        # operator at boot, but the FIRST `aios` invocation of a session's life can
+        # race it (or land before useradd finishes), and a shell pane started as
+        # root that way stays root forever after: re-attaching below only shows
+        # the existing session, it never re-evaluates RUN_SHELL. Only the pane
+        # creation branch further down does that, and it only runs once per
+        # session's whole life. So the shell pane is checked and, if needed,
+        # corrected on EVERY attach, not just on creation — a live pod that has
+        # been up for days converges the next time anyone logs in, with no
+        # restart and no manual `su` required.
+        #
+        # Found by @role, a per-pane tmux option set at creation (below), not by
+        # title or index: pane_title is cosmetic and gets overwritten by the
+        # shell's own prompt the first time it draws (confirmed live — a pane
+        # titled "shell" at creation read "root@aios aios" days later), and
+        # pane index is positional and explicitly not how this file targets
+        # panes anywhere else.
+        if id "$AIOS_OPERATOR" >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
+            shellpane=$(tmux -f "$CONF" list-panes -t "$WINDOW" -F '#{pane_id} #{@role}' 2>/dev/null |
+                awk '$2 == "shell" {print $1; exit}')
+            if [ -n "$shellpane" ]; then
+                pid=$(tmux -f "$CONF" display-message -p -t "$shellpane" '#{pane_pid}' 2>/dev/null)
+                user=$([ -n "$pid" ] && ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+                if [ "$user" = root ]; then
+                    tmux -f "$CONF" respawn-pane -k -t "$shellpane" "exec su - $AIOS_OPERATOR" 2>/dev/null || true
+                    tmux -f "$CONF" select-pane -t "$shellpane" -T shell 2>/dev/null || true
+                fi
+            fi
+        fi
         exec tmux -f "$CONF" attach-session -t "$SESSION"
     fi
 
@@ -172,6 +201,12 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     tmux -f "$CONF" select-pane -t "$PROMPT" -T prompt
     tmux -f "$CONF" select-pane -t "$SHELLPANE" -T shell
     tmux -f "$CONF" select-pane -t "$DASHBOARD" -T dashboard
+    # A per-pane option, not just the title above: the title is what a human
+    # sees and the shell overwrites it the moment it draws its own prompt, but
+    # @role is never touched by anything running inside the pane, so a later
+    # attach can still find "the shell pane" by id after days of use and
+    # correct it if it is still root (see the has-session branch above).
+    tmux -f "$CONF" set-option -p -t "$SHELLPANE" @role shell
     tmux -f "$CONF" select-pane -t "$PROMPT"   # the prompt, and it stays the prompt
     exec tmux -f "$CONF" attach-session -t "$SESSION"
 fi
