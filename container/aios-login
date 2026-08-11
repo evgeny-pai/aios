@@ -130,15 +130,22 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
         # titled "shell" at creation read "root@aios aios" days later), and
         # pane index is positional and explicitly not how this file targets
         # panes anywhere else.
+        #
+        # Correctness is tracked with a SECOND option, @shell_user, rather than
+        # asked of the live process — `ps` on the pane's own pid answers "root"
+        # even after a successful fix, because `su - operator` forks a CHILD to
+        # run as the target user and `su` itself stays root, waiting. Checking
+        # the pane's pid would see root forever and re-respawn a perfectly
+        # correct pane on every single login.
         if id "$AIOS_OPERATOR" >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
             shellpane=$(tmux -f "$CONF" list-panes -t "$WINDOW" -F '#{pane_id} #{@role}' 2>/dev/null |
                 awk '$2 == "shell" {print $1; exit}')
             if [ -n "$shellpane" ]; then
-                pid=$(tmux -f "$CONF" display-message -p -t "$shellpane" '#{pane_pid}' 2>/dev/null)
-                user=$([ -n "$pid" ] && ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
-                if [ "$user" = root ]; then
+                recorded=$(tmux -f "$CONF" show-options -p -v -t "$shellpane" @shell_user 2>/dev/null)
+                if [ "$recorded" != "$AIOS_OPERATOR" ]; then
                     tmux -f "$CONF" respawn-pane -k -t "$shellpane" "exec su - $AIOS_OPERATOR" 2>/dev/null || true
                     tmux -f "$CONF" select-pane -t "$shellpane" -T shell 2>/dev/null || true
+                    tmux -f "$CONF" set-option -p -t "$shellpane" @shell_user "$AIOS_OPERATOR" 2>/dev/null || true
                 fi
             fi
         fi
@@ -164,8 +171,10 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     # but a boot where useradd failed must land in a root shell, not a pane that
     # exits on a user su cannot find.
     RUN_SHELL="exec bash -l"
+    SHELL_USER=root
     if id "$AIOS_OPERATOR" >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
         RUN_SHELL="exec su - $AIOS_OPERATOR"
+        SHELL_USER="$AIOS_OPERATOR"
     fi
 
     # Every pane starts as a login shell and is respawned with its real command
@@ -207,6 +216,11 @@ if [ "${AIOS_SPLIT:-1}" != 0 ] && command -v tmux >/dev/null 2>&1; then
     # attach can still find "the shell pane" by id after days of use and
     # correct it if it is still root (see the has-session branch above).
     tmux -f "$CONF" set-option -p -t "$SHELLPANE" @role shell
+    # What RUN_SHELL actually resolved to just above — root if the account
+    # was not ready yet, the operator's name otherwise — so a later attach
+    # can tell "already correct" from "still needs fixing" without asking
+    # the live process (which would say root either way; see above).
+    tmux -f "$CONF" set-option -p -t "$SHELLPANE" @shell_user "$SHELL_USER"
     tmux -f "$CONF" select-pane -t "$PROMPT"   # the prompt, and it stays the prompt
     exec tmux -f "$CONF" attach-session -t "$SESSION"
 fi
