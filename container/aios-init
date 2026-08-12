@@ -351,6 +351,27 @@ else
     note "skills mesh" "AIOS_SKILLS_PUSH=0 — this node keeps its skills to itself"
 fi
 
+# Same reasoning as the skills push just above, for a different gap: ConductorAI's
+# own view of "is there an aios node here" comes from probing docker for a
+# container it manages itself, which a Kubernetes pod can never be — so it reports
+# none, and repo_context serves whatever memory notes happen to be lying around
+# instead (observed live: 9-11 day old notes about a DIFFERENT machine, presented
+# as current). This node reporting its own measured state — generation, lock
+# digest, packages actually on disk — is the fix, since repo_status is one row
+# per repo, last-write-wins, so a fresh push supersedes stale ones with no need to
+# find and edit anything.
+if [ "${AIOS_STATUS_PUSH:-1}" = 1 ]; then
+    (
+        while :; do
+            python3 -m aios.status push >>/var/log/aios-status.log 2>&1 || true
+            sleep "${AIOS_STATUS_PUSH_INTERVAL:-300}"
+        done
+    ) &
+    step ok "status mesh" "reporting live status to ConductorAI every ${AIOS_STATUS_PUSH_INTERVAL:-300}s"
+else
+    note "status mesh" "AIOS_STATUS_PUSH=0 — this node does not report itself"
+fi
+
 # The generation is earned, not assumed: only a boot whose required checks all
 # passed counts as this machine having come up again.
 #
