@@ -351,6 +351,25 @@ else
     note "skills mesh" "AIOS_SKILLS_PUSH=0 — this node keeps its skills to itself"
 fi
 
+# Skills mesh (read direction): pull skills other nodes have pushed into
+# .aios/skills-mesh/, the read half of the loop just above. Same shape: one
+# short-lived invocation per tick, since=<last successful pull's watermark>
+# persisted at .aios/skills-pull.json so a restarted pod resumes instead of
+# re-asking for the mesh's entire skill history. aios.skills.pull() never
+# raises. Writes outside skills/ deliberately — skills/ is replaced wholesale
+# by every self-update (see aios.skills.pull's docstring).
+if [ "${AIOS_SKILLS_PULL:-1}" = 1 ]; then
+    (
+        while :; do
+            python3 -m aios.skills pull >>/var/log/aios-skills-pull.log 2>&1 || true
+            sleep "${AIOS_SKILLS_PULL_INTERVAL:-300}"
+        done
+    ) &
+    step ok "skills mesh (pull)" "pulling mesh skills every ${AIOS_SKILLS_PULL_INTERVAL:-300}s"
+else
+    note "skills mesh (pull)" "AIOS_SKILLS_PULL=0 — this node only shares, never reads others' skills"
+fi
+
 # Same reasoning as the skills push just above, for a different gap: ConductorAI's
 # own view of "is there an aios node here" comes from probing docker for a
 # container it manages itself, which a Kubernetes pod can never be — so it reports

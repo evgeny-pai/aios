@@ -31,7 +31,18 @@ the normal case for "up", not "down" is the exception this degrades to:
     `updated_at` — a fresh `uuid4` every sweep would duplicate all 46-plus
     skills once per pod generation instead of updating them in place.
 
+`pull()` is the other direction, and deliberately NOT symmetric with push(): it
+sends `since` as the watermark from its own last successful pull (0 on first
+run) instead of "now", specifically so the daemon's reply is NOT empty. What
+comes back lands at .aios/skills-mesh/<slug>/SKILL.md rather than skills/ —
+skills/ is a PAYLOAD entry aios.update.swap_in() replaces wholesale on every
+self-update, so anything written there that isn't git-tracked would be deleted
+on the next tick (skills/payload-list-is-a-deletion-list). A slug already
+authored locally under skills/ is left untouched by design: that copy is
+already where the agent reads first.
+
     python3 -m aios.skills push
+    python3 -m aios.skills pull
 """
 
 from __future__ import annotations
@@ -71,6 +82,17 @@ NAMESPACE = uuid.UUID("f2da3c91-d5bf-4f49-bd6a-249bbae7fe13")
 Transport = Callable[[str, dict, bytes, float], bytes]
 
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
+
+#: Where a pull lands what other nodes have shared. Deliberately outside skills/
+#: — see the module docstring's `pull()` paragraph for why.
+PULL_DIR = ".aios/skills-mesh"
+PULL_STATE_PATH = ".aios/skills-pull.json"
+
+#: A pulled row's `name` becomes a directory name (skills-mesh/<name>/SKILL.md),
+#: and that row is network input from a peer this node does not authenticate
+#: beyond the shared mesh token. Reject anything that is not a plain slug before
+#: it ever reaches a path.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -208,10 +230,179 @@ def push(
     return f"pushed {len(skills)} skill(s) to {mesh.scrub(base)}"
 
 
+@dataclass(frozen=True)
+class Pulled:
+    """One pull's outcome. Never raised — same posture as push()'s return value."""
+
+    ok: bool = False
+    detail: str = ""
+    written: tuple[str, ...] = ()
+    skipped: int = 0
+
+
+def _state_path(root: Path) -> Path:
+    return root / PULL_STATE_PATH
+
+
+def _load_state(root: Path) -> dict:
+    """The last pull's watermark and per-slug cache. Missing or corrupt reads as fresh.
+
+    No state file is what a node that has never pulled before looks like, not an
+    error — same posture as push()'s empty-skills-list case.
+    """
+    try:
+        data = json.loads(_state_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"since": 0, "skills": {}}
+    if not isinstance(data, dict):
+        return {"since": 0, "skills": {}}
+    cache = data.get("skills")
+    return {
+        "since": _as_int(data.get("since")),
+        "skills": cache if isinstance(cache, dict) else {},
+    }
+
+
+def _save_state(root: Path, state: dict) -> None:
+    """Write .new then replace: same directory as the target, so the rename can
+    never cross a device (skills/rename-fails-cross-device), and a reader never
+    observes a half-written file.
+    """
+    path = _state_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".new")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _render(row: dict) -> str:
+    """The inverse of `_parse`: a mesh row rendered back into a SKILL.md's own shape."""
+    name = str(row.get("name") or "")
+    description = str(row.get("when_to_use") or "")
+    body = str(row.get("body") or "").strip()
+    return f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"
+
+
+def pull(
+    root: Path,
+    *,
+    repo: str = "aios",
+    by: str = "",
+    transport: Transport | None = None,
+    timeout: float = TIMEOUT_S,
+) -> Pulled:
+    """Best-effort pull of skills the mesh has that this node's cache doesn't.
+
+    Mirrors push() structurally but not in intent: push sets `since` to "now"
+    specifically to keep the reply empty; pull sets it to the watermark from its
+    OWN last successful pull (0 on first run) specifically so the reply is not.
+    Same /api/sync endpoint — there is no separate read route — with an empty
+    `push` block, since the push loop already covers sharing this node's own
+    skills on its own schedule. Never raises, and never touches skills/: see the
+    module docstring for why pulled content lands at .aios/skills-mesh/ instead.
+    """
+    state = _load_state(root)
+    since = state["since"]
+    cached: dict = dict(state["skills"])
+    now = int(time() * 1000)
+    payload = {
+        "since": since,
+        "push": {"now": now, "memory": [], "repo_status": [], "skills": []},
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "aios-skills/0.1",
+    }
+    token = os.environ.get(mesh.TOKEN_ENV, "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if by:
+        # Provenance only, same as push() — deliberately no x-conductorai-port.
+        headers["x-conductorai-host"] = by
+    base = mesh.endpoint()
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        raw = (transport or _post)(base + SYNC_PATH, headers, body, timeout)
+    except Exception as exc:  # noqa: BLE001 — same posture as push(): never fail
+        # the caller over a network that is not this machine's problem.
+        reason = getattr(exc, "reason", None) or exc
+        return Pulled(False, mesh.scrub(f"pull failed: {type(exc).__name__}: {reason}")[:160])
+
+    try:
+        response = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, AttributeError):
+        return Pulled(False, "pull failed: mesh answered with a body that is not JSON")
+    if not isinstance(response, dict):
+        return Pulled(False, "pull failed: mesh answered JSON that is not an object")
+
+    # The exact shape of `pull` is inferred, not verified against ConductorAI's own
+    # source (none is checked out on this machine) — accept a dict with a `skills`
+    # list, or a bare list, and say plainly when neither is what came back, so a
+    # shape mismatch reads differently in a log line than a genuinely idle mesh.
+    pull_payload = response.get("pull")
+    if isinstance(pull_payload, dict):
+        rows = pull_payload.get("skills")
+    elif isinstance(pull_payload, list):
+        rows = pull_payload
+    else:
+        rows = None
+    if not isinstance(rows, list):
+        return Pulled(
+            True,
+            "mesh answered but had no pull.skills — response shape may not match "
+            "what aios.skills expects",
+        )
+
+    written: list[str] = []
+    skipped = 0
+    any_write_failed = False
+    for row in rows:
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        slug = str(row.get("name") or "")
+        if row.get("repo") != repo or row.get("deleted_at") or not _SLUG_RE.match(slug):
+            skipped += 1
+            continue
+        if (root / "skills" / slug / "SKILL.md").exists():
+            # Already authored locally — that copy is what the agent reads first,
+            # so a mesh cache of the same slug adds nothing but drift risk.
+            skipped += 1
+            continue
+        updated_at = _as_int(row.get("updated_at"))
+        if updated_at <= cached.get(slug, 0):
+            skipped += 1
+            continue
+        target = root / PULL_DIR / slug / "SKILL.md"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(_render(row), encoding="utf-8")
+        except OSError:
+            # A row that failed to write must hold the watermark back so the next
+            # tick retries it — unlike a row skipped for a deliberate reason, which
+            # must not.
+            any_write_failed = True
+            continue
+        cached[slug] = updated_at
+        written.append(slug)
+
+    next_since = since if any_write_failed else (_as_int(response.get("now")) or now)
+    _save_state(root, {"since": next_since, "skills": cached})
+    return Pulled(True, f"pulled {len(written)} skill(s), {skipped} skipped", tuple(written), skipped)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv != ["push"]:
-        print("usage: python3 -m aios.skills push", file=sys.stderr)
+    if argv not in (["push"], ["pull"]):
+        print("usage: python3 -m aios.skills {push|pull}", file=sys.stderr)
         return 2
     root = Path(os.environ.get("AIOS_ROOT", "/aios"))
     try:
@@ -221,9 +412,12 @@ def main(argv: list[str] | None = None) -> int:
         # situation — "everything from this machine currently reaches the mesh
         # through the host's share daemon" — which is this module's daemon too.
         by = identity.node_label(root)
-    except Exception:  # noqa: BLE001 — a naming failure must not block the push
+    except Exception:  # noqa: BLE001 — a naming failure must not block push/pull
         by = ""
-    print(push(discover(root), by=by))
+    if argv == ["push"]:
+        print(push(discover(root), by=by))
+    else:
+        print(pull(root, by=by).detail)
     return 0
 
 
