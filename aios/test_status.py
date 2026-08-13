@@ -109,6 +109,46 @@ class PushTests(unittest.TestCase):
         self.assertEqual(row["repo"], "github.com/evgeny-pai/aios")
         self.assertEqual(row["focus"], "some status")
 
+    def test_no_node_id_skips_the_heartbeat(self) -> None:
+        fake = Fake({"now": 1, "peer_state": {}, "pull": {}})
+        result = status.push("s", transport=fake)
+        body = json.loads(fake.calls[0][2])
+        self.assertEqual(body["push"]["memory"], [])
+        self.assertIn("heartbeat skipped", result)
+
+    def test_node_id_pushes_a_liveness_heartbeat(self) -> None:
+        fake = Fake({"now": 1, "peer_state": {}, "pull": {}})
+        result = status.push("s", node_id="node-abc123", transport=fake)
+        body = json.loads(fake.calls[0][2])
+        rows = body["push"]["memory"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["content"], "s")
+        self.assertEqual(json.loads(row["tags"]), ["aios-node", "liveness"])
+        self.assertEqual(row["repo"], "github.com/evgeny-pai/aios")
+        self.assertGreater(row["expires_at"], row["created_at"])
+        self.assertIsNotNone(row["agent_id"])
+        self.assertIn("liveness heartbeat", result)
+
+    def test_heartbeat_id_is_stable_across_pushes(self) -> None:
+        fake1 = Fake({"now": 1, "peer_state": {}, "pull": {}})
+        fake2 = Fake({"now": 1, "peer_state": {}, "pull": {}})
+        status.push("s1", node_id="node-abc123", transport=fake1)
+        status.push("s2 (different content)", node_id="node-abc123", transport=fake2)
+        row1 = json.loads(fake1.calls[0][2])["push"]["memory"][0]
+        row2 = json.loads(fake2.calls[0][2])["push"]["memory"][0]
+        self.assertEqual(row1["id"], row2["id"])
+        self.assertEqual(row1["agent_id"], row2["agent_id"])
+
+    def test_heartbeat_id_differs_by_node(self) -> None:
+        fake1 = Fake({"now": 1, "peer_state": {}, "pull": {}})
+        fake2 = Fake({"now": 1, "peer_state": {}, "pull": {}})
+        status.push("s", node_id="node-one", transport=fake1)
+        status.push("s", node_id="node-two", transport=fake2)
+        row1 = json.loads(fake1.calls[0][2])["push"]["memory"][0]
+        row2 = json.loads(fake2.calls[0][2])["push"]["memory"][0]
+        self.assertNotEqual(row1["id"], row2["id"])
+
     def test_never_sends_port_header(self) -> None:
         fake = Fake({"now": 1, "peer_state": {}, "pull": {}})
         status.push("s", by="aios-1-anvil", transport=fake)
